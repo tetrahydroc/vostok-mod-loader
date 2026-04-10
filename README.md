@@ -1,12 +1,12 @@
 # Road to Vostok — Community Mod Loader
 
-A community-built mod loader for **Road to Vostok Demo** (Godot 4). Adds a launcher UI before the game starts, letting you enable/disable mods, set load order priority, check for updates, and preview compatibility issues before they cause problems in-game.
+A community-built mod loader for **Road to Vostok** (Godot 4). Adds a launcher UI before the game starts, letting you enable/disable mods, set load order priority, check for updates, and preview compatibility issues before they cause problems in-game.
 
 ---
 
 ## Requirements
 
-- Road to Vostok Demo (PC, Steam)
+- Road to Vostok(PC, Steam)
 - Mods packaged as `.zip`, `.vmz`, or `.pck` files
 
 ---
@@ -15,17 +15,17 @@ A community-built mod loader for **Road to Vostok Demo** (Godot 4). Adds a launc
 
 1. Copy `override.cfg` into the game installation folder:
    ```
-   C:\Program Files (x86)\Steam\steamapps\common\Road to Vostok Demo\
+   C:\Program Files (x86)\Steam\steamapps\common\Road to Vostok\
    ```
 
 2. Copy `modloader.gd` into the game's data folder:
    ```
-   C:\Users\<your username>\AppData\Roaming\Road to Vostok Demo\
+   C:\Users\<your username>\AppData\Roaming\Road to Vostok\
    ```
 
 3. Create a `mods` folder inside the game installation folder if it doesn't exist:
    ```
-   C:\Program Files (x86)\Steam\steamapps\common\Road to Vostok Demo\mods\
+   C:\Program Files (x86)\Steam\steamapps\common\Road to Vostok\mods\
    ```
 
 4. Place your `.vmz` or `.zip` mod files inside the `mods` folder.
@@ -114,7 +114,7 @@ Mods without `mod.txt` are still mounted as resource packs — their files overr
 After each launch (with developer mode enabled), a full conflict log is written to:
 
 ```
-%APPDATA%\Road to Vostok Demo\modloader_conflicts.txt
+%APPDATA%\Road to Vostok\modloader_conflicts.txt
 ```
 
 ### What the messages mean
@@ -148,7 +148,7 @@ After each launch (with developer mode enabled), a full conflict log is written 
 
 Delete `override.cfg` from the Steam installation folder and `modloader.gd` from the AppData folder. The `mods` folder and its contents can be removed separately.
 
-Settings are stored in `%APPDATA%\Road to Vostok Demo\mod_config.cfg` and can be deleted safely.
+Settings are stored in `%APPDATA%\Road to Vostok\mod_config.cfg` and can be deleted safely.
 
 ---
 
