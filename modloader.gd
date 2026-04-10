@@ -167,6 +167,8 @@ func _build_folder_entry(mods_dir: String, dir_name: String) -> Dictionary:
 	return _entry_from_config(cfg, dir_name, folder_path, "folder")
 
 
+# Future: mod.txt may support [mod] load_after = "other_mod_id" for soft dependencies.
+# This would feed into a topological sort pass before the priority/name sort.
 func _entry_from_config(cfg: ConfigFile, file_name: String, full_path: String, ext: String) -> Dictionary:
 	var mod_name := file_name
 	var mod_id   := file_name
@@ -506,7 +508,7 @@ func _build_mods_tab() -> Control:
 		for child in order_list.get_children():
 			child.queue_free()
 		var sorted := _ui_mod_entries.filter(func(e): return e["enabled"])
-		sorted.sort_custom(func(a, b): return a["priority"] < b["priority"])
+		sorted.sort_custom(_compare_load_order)
 		if sorted.is_empty():
 			var lbl := Label.new()
 			lbl.text = "(none enabled)"
@@ -800,7 +802,7 @@ func _run_dry_compat_analysis(populate_cb: Callable) -> void:
 	DirAccess.make_dir_recursive_absolute(ProjectSettings.globalize_path(TMP_DIR))
 
 	var sorted := _ui_mod_entries.filter(func(e): return e["enabled"])
-	sorted.sort_custom(func(a, b): return a["priority"] < b["priority"])
+	sorted.sort_custom(_compare_load_order)
 
 	if sorted.is_empty():
 		populate_cb.call([])
@@ -1145,17 +1147,27 @@ func _load_all_mods() -> void:
 		if not entry["enabled"]:
 			continue
 		candidates.append(entry.duplicate())
-	candidates.sort_custom(func(a, b): return a["priority"] < b["priority"])
+	candidates.sort_custom(_compare_load_order)
 
 	if candidates.is_empty():
 		_log_info("No mods enabled.")
 		return
 
+	# Warn about duplicate mod names — likely a packaging mistake or fork.
+	# The sort is still deterministic (file_name tiebreaker), but users should know.
+	for i in range(1, candidates.size()):
+		if (candidates[i]["mod_name"] as String).to_lower() \
+				== (candidates[i - 1]["mod_name"] as String).to_lower():
+			_log_warning("Duplicate mod name '" + candidates[i]["mod_name"]
+					+ "' — archives '" + candidates[i - 1]["file_name"]
+					+ "' and '" + candidates[i]["file_name"]
+					+ "'. Load order tie broken by archive filename.")
+
 	_log_info("=== Load Order ===")
 	for i in candidates.size():
 		var c: Dictionary = candidates[i]
-		var tag := " [priority=" + str(c["priority"]) + "]" if c["priority"] != 0 else ""
-		_log_info("  [" + str(i + 1) + "] " + c["mod_name"] + " | " + c["file_name"] + tag)
+		_log_info("  [" + str(i + 1) + "] " + c["mod_name"] + " | " + c["file_name"]
+				+ " [priority=" + str(c["priority"]) + "]")
 	_log_info("==================")
 
 	for load_index in candidates.size():
@@ -1323,6 +1335,18 @@ func _register_claim(res_path: String, mod_name: String, archive: String,
 		"mod_name": mod_name, "archive": archive, "load_index": load_index,
 		"claim_type": claim_type, "source_path": source_path,
 	})
+
+func _compare_load_order(a: Dictionary, b: Dictionary) -> bool:
+	if a["priority"] != b["priority"]:
+		return a["priority"] < b["priority"]
+	var a_name := (a["mod_name"] as String).to_lower()
+	var b_name := (b["mod_name"] as String).to_lower()
+	if a_name != b_name:
+		return a_name < b_name
+	# file_name is the archive's disk filename — guaranteed unique by the filesystem.
+	# This final tiebreaker makes the ordering a strict total order so that Godot's
+	# unstable introsort can never shuffle "equal" elements.
+	return (a["file_name"] as String).to_lower() < (b["file_name"] as String).to_lower()
 
 func _is_dangerous_path(res_path: String) -> bool:
 	return _vanilla_paths.has(res_path)
