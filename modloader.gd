@@ -7,6 +7,14 @@ const UI_CONFIG_PATH := "user://mod_config.cfg"
 const MODWORKSHOP_VERSIONS_URL := "https://api.modworkshop.net/mods/versions"
 const MODWORKSHOP_DOWNLOAD_URL_TEMPLATE := "https://api.modworkshop.net/mods/%s/download"
 
+# ─── Two-pass architecture constants ────────────────────────────────────────
+const PASS_STATE_PATH := "user://mod_pass_state.cfg"
+const HEARTBEAT_PATH := "user://modloader_heartbeat.txt"
+const SAFE_MODE_FILE := "modloader_safe_mode"
+const MAX_RESTART_COUNT := 2
+const MODLOADER_VERSION := "2.1.0"
+const MODLOADER_RES_PATH := "res://modloader.gd"
+
 const TRACKED_EXTENSIONS: Array[String] = ["gd", "tscn", "tres", "gdns", "gdnlib", "scn"]
 const LIFECYCLE_METHODS: Array[String] = [
 	"_ready", "_process", "_physics_process",
@@ -50,39 +58,165 @@ var _re_preload: RegEx
 var _re_filename_priority: RegEx
 
 
+# ─── File-scope archive mounting (Pass 2 only) ──────────────────────────────
+# Runs during Godot's autoload instantiation, before _init() and _ready().
+# If mod_pass_state.cfg exists, mounts all listed archives so that subsequent
+# autoloads (loaded from [autoload_prepend]) can resolve their res:// paths.
+var _pass2_mount_count: int = _try_file_scope_mount()
+
+
+static func _try_file_scope_mount() -> int:
+	var cfg := ConfigFile.new()
+	if cfg.load(PASS_STATE_PATH) != OK:
+		return 0
+	var paths: PackedStringArray = cfg.get_value("state", "archive_paths", PackedStringArray())
+	if paths.is_empty():
+		return 0
+	var count := 0
+	for path in paths:
+		if ProjectSettings.load_resource_pack(path):
+			count += 1
+		elif path.get_extension().to_lower() == "vmz":
+			var zip_path := _static_vmz_to_zip(path)
+			if not zip_path.is_empty() and ProjectSettings.load_resource_pack(zip_path):
+				count += 1
+	return count
+
+
+static func _static_vmz_to_zip(vmz_path: String) -> String:
+	var cache_dir := ProjectSettings.globalize_path(TMP_DIR)
+	if not DirAccess.dir_exists_absolute(cache_dir):
+		DirAccess.make_dir_recursive_absolute(cache_dir)
+	var zip_name := vmz_path.get_file().get_basename() + ".zip"
+	var zip_path := cache_dir.path_join(zip_name)
+	if FileAccess.file_exists(zip_path):
+		return zip_path
+	var src := FileAccess.open(vmz_path, FileAccess.READ)
+	if src == null:
+		return ""
+	var dst := FileAccess.open(zip_path, FileAccess.WRITE)
+	if dst == null:
+		src.close()
+		return ""
+	while src.get_position() < src.get_length():
+		dst.store_buffer(src.get_buffer(65536))
+	src.close()
+	dst.close()
+	return zip_path
+
+
 # ─── Entry point ──────────────────────────────────────────────────────────────
 
 func _ready() -> void:
 	if _has_loaded:
 		return
 	_has_loaded = true
+	# When loaded via bootstrap (metro-modloader.zip), mount count is passed via meta.
+	if has_meta("_pass2_mount_count"):
+		_pass2_mount_count = get_meta("_pass2_mount_count")
 	# Autoloads run while the scene tree is still setting up children.
 	# Wait one frame so add_child() and DisplayServer queries work correctly.
 	await get_tree().process_frame
-	_log_info("Metro Mod Loader — exe: " + OS.get_executable_path()
-			+ "  user: " + OS.get_user_data_dir())
+	if "--modloader-restart" in OS.get_cmdline_user_args():
+		_run_pass_2()
+	else:
+		await _run_pass_1()
+
+
+# ─── Pass 1: Normal launch — show UI, configure, optionally restart ─────────
+
+func _run_pass_1() -> void:
+	_log_info("Metro Mod Loader v" + MODLOADER_VERSION + " — exe: "
+			+ OS.get_executable_path() + "  user: " + OS.get_user_data_dir())
+	# Safety: crash recovery and safe mode checks before anything else.
+	_check_crash_recovery()
+	_check_safe_mode()
 	_compile_regex()
 	_load_developer_mode_setting()
 	_ui_mod_entries = _collect_mod_metadata()
 	_load_ui_config()
 	await _show_mod_ui()
 	_save_ui_config()
+	# Mount all enabled mods and collect autoload entries (populates _pending_autoloads).
 	_load_all_mods()
+	# Classify autoloads: ! prefix = early (needs [autoload_prepend]), rest = late.
+	var sections := _build_autoload_sections()
+	if sections.prepend.size() > 0:
+		# Early autoloads exist — write override.cfg, save state, restart.
+		# Do NOT instantiate autoloads yet — Pass 2 will handle that.
+		_log_info("Early autoloads detected (%d) — preparing two-pass restart..."
+				% sections.prepend.size())
+		_write_heartbeat()
+		var archive_paths := _collect_enabled_archive_paths()
+		var cfg_err := _write_override_cfg(sections.prepend)
+		if cfg_err != OK:
+			_log_critical("Failed to write override.cfg (error %d) — single-pass fallback" % cfg_err)
+			_finish_single_pass()
+			return
+		_write_pass_state(archive_paths)
+		_log_info("Restarting with [autoload_prepend]...")
+		OS.set_restart_on_exit(true, ["--", "--modloader-restart"])
+		get_tree().quit()
+		return
+	# No early autoloads — instantiate and reload (single-pass, no restart).
+	_finish_single_pass()
+
+
+# Finish single-pass: instantiate queued autoloads, reload. Called after _load_all_mods().
+func _finish_single_pass() -> void:
 	for entry in _pending_autoloads:
 		_instantiate_autoload(entry["mod_name"], entry["name"], entry["path"])
 	if _developer_mode:
 		_log_override_timing_warnings()
 		_print_conflict_summary()
 		_write_conflict_report()
+	_delete_heartbeat()
 	# Reload so mounted resource overrides and take_over_path() apply to the scene.
-	# Needed for ALL mods that replace files, not just those with autoloads.
 	if not _archive_file_sets.is_empty() or _pending_autoloads.size() > 0:
 		var reload_err := get_tree().reload_current_scene()
 		if reload_err != OK:
 			_log_critical("reload_current_scene() failed with error " + str(reload_err))
 			return
-		# Wait for the reloaded scene to be ready before auditing override instances.
-		# The modloader persists across reloads (it's an autoload), so this works.
+		if _developer_mode:
+			await get_tree().process_frame
+			_audit_override_instances()
+
+
+# ─── Pass 2: Modloader-triggered restart — archives already mounted ─────────
+
+func _run_pass_2() -> void:
+	_log_info("Metro Mod Loader v" + MODLOADER_VERSION + " — Pass 2")
+	_log_info("  %d archive(s) mounted at file-scope" % _pass2_mount_count)
+	_clear_restart_counter()
+	_compile_regex()
+	_load_developer_mode_setting()
+	_ui_mod_entries = _collect_mod_metadata()
+	_load_ui_config()
+	# Early mod autoloads are already in the scene tree (Godot loaded them
+	# from [autoload_prepend] in override.cfg). Mount remaining archives and
+	# instantiate late autoloads that aren't already present.
+	_load_all_mods("Pass 2")
+	for entry in _pending_autoloads:
+		if get_tree().root.has_node(entry["name"]):
+			_log_info("  Autoload '" + entry["name"] + "' already in tree (early) — skipped")
+			continue
+		_instantiate_autoload(entry["mod_name"], entry["name"], entry["path"])
+	if _developer_mode:
+		_log_override_timing_warnings()
+		_print_conflict_summary()
+		_write_conflict_report()
+	_delete_heartbeat()
+	# Clean up pass state FIRST — prevents stale file-scope mounts if next line crashes.
+	if FileAccess.file_exists(PASS_STATE_PATH):
+		DirAccess.remove_absolute(ProjectSettings.globalize_path(PASS_STATE_PATH))
+	# Restore clean override.cfg so next normal launch starts fresh.
+	_restore_clean_override_cfg()
+	# Reload so mounted resource overrides and take_over_path() apply to the scene.
+	if _pass2_mount_count > 0 or not _archive_file_sets.is_empty() or _pending_autoloads.size() > 0:
+		var reload_err := get_tree().reload_current_scene()
+		if reload_err != OK:
+			_log_critical("reload_current_scene() failed with error " + str(reload_err))
+			return
 		if _developer_mode:
 			await get_tree().process_frame
 			_audit_override_instances()
@@ -934,7 +1068,7 @@ func _check_updates_for_ui(status_info: Dictionary, add_log: Callable, check_btn
 
 # ─── Main load loop ───────────────────────────────────────────────────────────
 
-func _load_all_mods() -> void:
+func _load_all_mods(pass_label: String = "") -> void:
 	_pending_autoloads.clear()
 	_loaded_mod_ids.clear()
 	_registered_autoload_names.clear()
@@ -968,12 +1102,13 @@ func _load_all_mods() -> void:
 					+ "' and '" + candidates[i]["file_name"]
 					+ "'. Load order tie broken by archive filename.")
 
-	_log_info("=== Load Order ===")
+	var header := "=== Load Order" + (" (" + pass_label + ")" if pass_label != "" else "") + " ==="
+	_log_info(header)
 	for i in candidates.size():
 		var c: Dictionary = candidates[i]
 		_log_info("  [" + str(i + 1) + "] " + c["mod_name"] + " | " + c["file_name"]
 				+ " [priority=" + str(c["priority"]) + "]")
-	_log_info("==================")
+	_log_info("=" .repeat(header.length()))
 
 	for load_index in candidates.size():
 		_process_mod_candidate(candidates[load_index], load_index)
@@ -1046,8 +1181,12 @@ func _process_mod_candidate(c: Dictionary, load_index: int) -> void:
 	var keys: PackedStringArray = cfg.get_section_keys("autoload")
 	for key in keys:
 		var autoload_name := str(key)
-		# Strip Godot autoload prefix (*) and VostokMods early-autoload prefix (!).
-		var res_path := str(cfg.get_value("autoload", key)).lstrip("*!").strip_edges()
+		# Strip Godot autoload prefix (*), detect early-autoload prefix (!).
+		var raw_path := str(cfg.get_value("autoload", key)).lstrip("*").strip_edges()
+		var is_early := raw_path.begins_with("!")
+		if is_early:
+			raw_path = raw_path.lstrip("!")
+		var res_path := raw_path
 
 		if res_path == "":
 			_log_warning("  Empty autoload path for '" + autoload_name + "' — skipped")
@@ -1071,8 +1210,12 @@ func _process_mod_candidate(c: Dictionary, load_index: int) -> void:
 				_log_critical("    Similar paths in archive: " + ", ".join(similar))
 			continue
 
-		_pending_autoloads.append({ "mod_name": mod_name, "name": autoload_name, "path": res_path })
-		_log_info("  Autoload queued: " + autoload_name + " -> " + res_path)
+		_pending_autoloads.append({
+			"mod_name": mod_name, "name": autoload_name, "path": res_path,
+			"is_early": is_early,
+		})
+		var early_tag := " [EARLY]" if is_early else ""
+		_log_info("  Autoload queued: " + autoload_name + " -> " + res_path + early_tag)
 		_register_claim(res_path, mod_name, file_name, load_index)
 
 
@@ -1361,6 +1504,170 @@ func _collect_live_scripts(root_node: Node, out: Dictionary) -> void:
 			if path != "":
 				out[path] = (out.get(path, 0) as int) + 1
 		stack.append_array(node.get_children())
+
+
+# ─── Two-pass helpers ─────────────────────────────────────────────────────────
+
+# Classify pending autoloads into prepend (early, ! prefix) and append (late).
+# ModLoader is always LAST in prepend — reverse insertion means last listed loads first.
+func _build_autoload_sections() -> Dictionary:
+	var prepend: Array[Dictionary] = []
+	var append: Array[Dictionary] = []
+	for entry in _pending_autoloads:
+		if entry.get("is_early", false):
+			prepend.append({ "name": entry["name"], "path": entry["path"] })
+		else:
+			append.append({ "name": entry["name"], "path": entry["path"] })
+	return { "prepend": prepend, "append": append }
+
+
+# Collect full OS paths for all enabled mod archives (for pass state file).
+func _collect_enabled_archive_paths() -> PackedStringArray:
+	var paths := PackedStringArray()
+	var candidates: Array[Dictionary] = []
+	for entry in _ui_mod_entries:
+		if not entry["enabled"]:
+			continue
+		candidates.append(entry.duplicate())
+	candidates.sort_custom(_compare_load_order)
+	for c in candidates:
+		if c["ext"] == "zip":
+			continue
+		paths.append(c["full_path"])
+	return paths
+
+
+# Write override.cfg with FileAccess (not ConfigFile — ConfigFile erases null keys).
+# ModLoader is LAST in [autoload_prepend] (reverse insertion = last listed loads first).
+# Late (non-early) autoloads are NOT written here — Godot would try to load them
+# natively before archives are mounted, causing "file not found" errors. The modloader
+# handles late autoloads via add_child() in Pass 2 instead.
+# Atomic write: write .tmp then rename.
+func _write_override_cfg(prepend_autoloads: Array[Dictionary]) -> Error:
+	var exe_dir := OS.get_executable_path().get_base_dir()
+	var path := exe_dir.path_join("override.cfg")
+	var tmp := path + ".tmp"
+	var lines := PackedStringArray()
+	if prepend_autoloads.size() > 0:
+		lines.append("[autoload_prepend]")
+		for entry in prepend_autoloads:
+			lines.append('%s="*%s"' % [entry["name"], entry["path"]])
+		# ModLoader LAST = loads FIRST (reverse insertion).
+		lines.append('ModLoader="*' + MODLOADER_RES_PATH + '"')
+		lines.append("")
+	# Only ModLoader in [autoload] — late mod autoloads are handled by Pass 2 via add_child().
+	lines.append("[autoload]")
+	if prepend_autoloads.is_empty():
+		lines.append('ModLoader="*' + MODLOADER_RES_PATH + '"')
+	lines.append("")
+	var f := FileAccess.open(tmp, FileAccess.WRITE)
+	if f == null:
+		return FileAccess.get_open_error()
+	f.store_string("\n".join(lines) + "\n")
+	f.close()
+	var dir := DirAccess.open(exe_dir)
+	if dir == null:
+		DirAccess.remove_absolute(tmp)
+		return ERR_CANT_OPEN
+	var rename_err := dir.rename(tmp.get_file(), path.get_file())
+	if rename_err != OK:
+		DirAccess.remove_absolute(tmp)
+	return rename_err
+
+
+# Persist archive paths and restart metadata for file-scope mounting in Pass 2.
+func _write_pass_state(archive_paths: PackedStringArray) -> void:
+	var cfg := ConfigFile.new()
+	cfg.load(PASS_STATE_PATH)  # OK if doesn't exist
+	var count: int = cfg.get_value("state", "restart_count", 0)
+	cfg.set_value("state", "restart_count", count + 1)
+	cfg.set_value("state", "mods_hash", _compute_mods_hash())
+	cfg.set_value("state", "archive_paths", archive_paths)
+	cfg.set_value("state", "modloader_version", MODLOADER_VERSION)
+	cfg.set_value("state", "timestamp", Time.get_unix_time_from_system())
+	var save_err := cfg.save(PASS_STATE_PATH)
+	if save_err != OK:
+		_log_critical("Failed to save pass state (error %d) — two-pass restart will fail" % save_err)
+
+
+func _compute_mods_hash() -> String:
+	var dir := DirAccess.open(_mods_dir)
+	if dir == null:
+		return ""
+	var entries := PackedStringArray()
+	dir.list_dir_begin()
+	var fname := dir.get_next()
+	while fname != "":
+		if not fname.begins_with("."):
+			entries.append(fname)
+		fname = dir.get_next()
+	dir.list_dir_end()
+	entries.sort()
+	return str(entries).md5_text()
+
+
+# Write heartbeat to detect crashes. Deleted on successful completion.
+func _write_heartbeat() -> void:
+	var f := FileAccess.open(HEARTBEAT_PATH, FileAccess.WRITE)
+	if f:
+		f.store_string("started:%d" % Time.get_unix_time_from_system())
+		f.close()
+
+
+func _delete_heartbeat() -> void:
+	if FileAccess.file_exists(HEARTBEAT_PATH):
+		DirAccess.remove_absolute(ProjectSettings.globalize_path(HEARTBEAT_PATH))
+
+
+# If heartbeat exists from a previous launch, the game crashed. Increment counter.
+# After MAX_RESTART_COUNT crashes, wipe override.cfg to clean state.
+func _check_crash_recovery() -> void:
+	if not FileAccess.file_exists(HEARTBEAT_PATH):
+		return
+	_log_warning("Heartbeat file found — previous launch may have crashed")
+	var cfg := ConfigFile.new()
+	if cfg.load(PASS_STATE_PATH) == OK:
+		var count: int = cfg.get_value("state", "restart_count", 0)
+		if count >= MAX_RESTART_COUNT:
+			_log_critical("Restart loop detected (%d crashes) — restoring clean override.cfg" % count)
+			_restore_clean_override_cfg()
+			DirAccess.remove_absolute(ProjectSettings.globalize_path(PASS_STATE_PATH))
+			_delete_heartbeat()
+			return
+	_delete_heartbeat()
+
+
+# User can create an empty "modloader_safe_mode" file in the game dir to force recovery.
+func _check_safe_mode() -> void:
+	var exe_dir := OS.get_executable_path().get_base_dir()
+	var safe_mode_path := exe_dir.path_join(SAFE_MODE_FILE)
+	if not FileAccess.file_exists(safe_mode_path):
+		return
+	_log_warning("Safe mode file detected — restoring clean override.cfg")
+	_restore_clean_override_cfg()
+	if FileAccess.file_exists(PASS_STATE_PATH):
+		DirAccess.remove_absolute(ProjectSettings.globalize_path(PASS_STATE_PATH))
+	_delete_heartbeat()
+	DirAccess.remove_absolute(safe_mode_path)
+
+
+# Write minimal override.cfg that only registers ModLoader.
+func _restore_clean_override_cfg() -> void:
+	var exe_dir := OS.get_executable_path().get_base_dir()
+	var f := FileAccess.open(exe_dir.path_join("override.cfg"), FileAccess.WRITE)
+	if f == null:
+		_log_critical("Cannot restore override.cfg — game dir may be read-only: " + exe_dir)
+		return
+	f.store_string("[autoload]\nModLoader=\"*" + MODLOADER_RES_PATH + "\"\n")
+	f.close()
+
+
+func _clear_restart_counter() -> void:
+	var cfg := ConfigFile.new()
+	if cfg.load(PASS_STATE_PATH) == OK:
+		cfg.set_value("state", "restart_count", 0)
+		cfg.save(PASS_STATE_PATH)
+
 
 
 # ─── Conflict summary ─────────────────────────────────────────────────────────
