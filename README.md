@@ -42,6 +42,9 @@ Enable or disable mods with checkboxes. The **priority number** controls load or
 ### Updates
 Click **Check for Updates** to see if any of your mods have newer versions available on ModWorkshop.
 
+### Settings
+Toggle **Developer Mode** to enable the Compatibility tab and verbose conflict logging. Off by default — only needed for mod authors or troubleshooting.
+
 Click **Launch Game** when you're ready to play.
 
 ---
