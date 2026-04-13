@@ -1,45 +1,48 @@
+## Metro Mod Loader — community mod loader for Road to Vostok (Godot 4.6+).
+## Loads .vmz/.pck archives from <game>/mods/ via a pre-game config window.
+## Two-pass architecture: mounts archives at file-scope, optionally restarts to
+## prepend mod autoloads before the game's own autoloads via [autoload_prepend].
 extends Node
 
+const MODLOADER_VERSION := "2.1.0"
+const MODLOADER_RES_PATH := "res://modloader.gd"
 const MOD_DIR := "mods"
 const TMP_DIR := "user://vmz_mount_cache"
-const CONFLICT_REPORT_PATH := "user://modloader_conflicts.txt"
 const UI_CONFIG_PATH := "user://mod_config.cfg"
+const CONFLICT_REPORT_PATH := "user://modloader_conflicts.txt"
+const PASS_STATE_PATH := "user://mod_pass_state.cfg"
+const HEARTBEAT_PATH := "user://modloader_heartbeat.txt"
+const SAFE_MODE_FILE := "modloader_safe_mode"
+const MAX_RESTART_COUNT := 2
+
 const MODWORKSHOP_VERSIONS_URL := "https://api.modworkshop.net/mods/versions"
 const MODWORKSHOP_DOWNLOAD_URL_TEMPLATE := "https://api.modworkshop.net/mods/%s/download"
+const MODWORKSHOP_BATCH_SIZE := 100
+const API_CHECK_TIMEOUT := 15.0
+const API_DOWNLOAD_TIMEOUT := 30.0
 
+const PRIORITY_MIN := -999
+const PRIORITY_MAX := 999
 const TRACKED_EXTENSIONS: Array[String] = ["gd", "tscn", "tres", "gdns", "gdnlib", "scn"]
 const LIFECYCLE_METHODS: Array[String] = [
 	"_ready", "_process", "_physics_process",
 	"_input", "_unhandled_input", "_unhandled_key_input",
 ]
 
-# ─── Tuning constants ────────────────────────────────────────────────────────
+var _mods_dir: String = ""
+var _developer_mode := false
+var _has_loaded := false
+var _last_mod_txt_status := "none"
+var _database_replaced_by := ""
 
-const MODWORKSHOP_BATCH_SIZE := 100     # mod IDs per API request
-const API_CHECK_TIMEOUT := 15.0         # seconds for version-check requests
-const API_DOWNLOAD_TIMEOUT := 30.0      # seconds for mod download requests
-const PRIORITY_MIN := -999
-const PRIORITY_MAX := 999
-
-# ─── State ────────────────────────────────────────────────────────────────────
-
-var _database_replaced_by: String = ""
+var _ui_mod_entries: Array[Dictionary] = []
+var _pending_autoloads: Array[Dictionary] = []
+var _report_lines: Array[String] = []
+var _loaded_mod_ids: Dictionary = {}
+var _registered_autoload_names: Dictionary = {}
 var _override_registry: Dictionary = {}
 var _mod_script_analysis: Dictionary = {}
 var _archive_file_sets: Dictionary = {}
-var _report_lines: Array[String] = []
-var _pending_autoloads: Array[Dictionary] = []
-var _loaded_mod_ids: Dictionary = {}
-var _registered_autoload_names: Dictionary = {}
-
-# Populated before any mounting. Each entry:
-# { file_name, full_path, ext, mod_name, mod_id, priority, enabled, cfg, mod_txt_status, warnings }
-var _ui_mod_entries: Array[Dictionary] = []
-
-var _last_mod_txt_status: String = "none"
-var _developer_mode: bool = false
-var _has_loaded: bool = false
-var _mods_dir: String = ""
 
 var _re_take_over: RegEx
 var _re_extends: RegEx
@@ -49,44 +52,227 @@ var _re_func: RegEx
 var _re_preload: RegEx
 var _re_filename_priority: RegEx
 
+# Mounts previous session's archives at file-scope (before _ready) so autoloads
+# that load after ModLoader can resolve their res:// paths.
+var _file_scope_mounts: int = _mount_previous_session()
 
-# ─── Entry point ──────────────────────────────────────────────────────────────
+static func _mount_previous_session() -> int:
+	var cfg := ConfigFile.new()
+	if cfg.load(PASS_STATE_PATH) != OK:
+		return 0
+	# Wipe stale state from a different modloader version (format may have changed).
+	var saved_ver: String = cfg.get_value("state", "modloader_version", "")
+	if saved_ver != MODLOADER_VERSION:
+		DirAccess.remove_absolute(ProjectSettings.globalize_path(PASS_STATE_PATH))
+		return 0
+	var paths: PackedStringArray = cfg.get_value("state", "archive_paths", PackedStringArray())
+	if paths.is_empty():
+		return 0
+
+	# Were any archives deleted since last session?
+	var any_missing := false
+	var any_stale := false
+	for path in paths:
+		var abs_path := path if not path.begins_with("res://") and not path.begins_with("user://") \
+				else ProjectSettings.globalize_path(path)
+		if FileAccess.file_exists(abs_path):
+			continue
+		# VMZ source gone — check if the zip cache survived.
+		if abs_path.get_extension().to_lower() == "vmz":
+			var cache_dir := ProjectSettings.globalize_path(TMP_DIR)
+			var cached := cache_dir.path_join(abs_path.get_file().get_basename() + ".zip")
+			if FileAccess.file_exists(cached):
+				any_stale = true
+				continue
+		any_missing = true
+
+	if any_missing:
+		# Archive gone, no cache. Wipe override.cfg autoload sections so the next
+		# boot is clean, but preserve any non-autoload settings ([display], etc.).
+		var exe_dir := OS.get_executable_path().get_base_dir()
+		var cfg_path := exe_dir.path_join("override.cfg")
+		var preserved := _read_preserved_cfg_sections(cfg_path)
+		var f := FileAccess.open(cfg_path, FileAccess.WRITE)
+		if f:
+			f.store_string("[autoload]\nModLoader=\"*" + MODLOADER_RES_PATH + "\"\n" + preserved)
+			f.close()
+		var state_path := ProjectSettings.globalize_path(PASS_STATE_PATH)
+		if FileAccess.file_exists(state_path):
+			DirAccess.remove_absolute(state_path)
+		return 0
+
+	if any_stale:
+		# Source gone but cache works — invalidate hash so Pass 1 rewrites state.
+		cfg.set_value("state", "mods_hash", "")
+		cfg.save(PASS_STATE_PATH)
+
+	var count := 0
+	for path in paths:
+		if ProjectSettings.load_resource_pack(path):
+			count += 1
+		elif path.get_extension().to_lower() == "vmz":
+			var zip_path := _static_vmz_to_zip(path)
+			if not zip_path.is_empty() and ProjectSettings.load_resource_pack(zip_path):
+				count += 1
+	return count
+
+static func _static_vmz_to_zip(vmz_path: String) -> String:
+	var cache_dir := ProjectSettings.globalize_path(TMP_DIR)
+	if not DirAccess.dir_exists_absolute(cache_dir):
+		DirAccess.make_dir_recursive_absolute(cache_dir)
+	var zip_name := vmz_path.get_file().get_basename() + ".zip"
+	var zip_path := cache_dir.path_join(zip_name)
+	if FileAccess.file_exists(zip_path):
+		# Re-extract if source is newer than cache (mod was updated in-place).
+		var src_time := FileAccess.get_modified_time(vmz_path)
+		var zip_time := FileAccess.get_modified_time(zip_path)
+		if src_time <= zip_time:
+			return zip_path
+	var src := FileAccess.open(vmz_path, FileAccess.READ)
+	if src == null:
+		return ""
+	var dst := FileAccess.open(zip_path, FileAccess.WRITE)
+	if dst == null:
+		src.close()
+		return ""
+	while src.get_position() < src.get_length():
+		dst.store_buffer(src.get_buffer(65536))
+	src.close()
+	dst.close()
+	return zip_path
+
+# Entry point
 
 func _ready() -> void:
 	if _has_loaded:
 		return
 	_has_loaded = true
-	# Autoloads run while the scene tree is still setting up children.
-	# Wait one frame so add_child() and DisplayServer queries work correctly.
 	await get_tree().process_frame
-	_log_info("Metro Mod Loader — exe: " + OS.get_executable_path()
-			+ "  user: " + OS.get_user_data_dir())
+	if "--modloader-restart" in OS.get_cmdline_user_args():
+		await _run_pass_2()
+	else:
+		await _run_pass_1()
+
+# Pass 1: Normal launch — show UI, configure, optionally restart
+
+func _run_pass_1() -> void:
+	_log_info("Metro Mod Loader v" + MODLOADER_VERSION)
+	_check_crash_recovery()
+	_check_safe_mode()
 	_compile_regex()
 	_load_developer_mode_setting()
-	_ui_mod_entries = _collect_mod_metadata()
+	_ui_mod_entries = collect_mod_metadata()
+	_clean_stale_cache()
 	_load_ui_config()
-	await _show_mod_ui()
+	await show_mod_ui()
 	_save_ui_config()
-	_load_all_mods()
+
+	load_all_mods()
+	var sections := _build_autoload_sections()
+	var archive_paths := _collect_enabled_archive_paths()
+
+	# Skip restart if mod state hasn't changed since last launch.
+	var new_hash := _compute_state_hash(archive_paths, sections.prepend)
+	var old_hash := ""
+	var state_cfg := ConfigFile.new()
+	if state_cfg.load(PASS_STATE_PATH) == OK:
+		old_hash = state_cfg.get_value("state", "mods_hash", "")
+
+	if new_hash == old_hash and not new_hash.is_empty():
+		_log_info("Mod state unchanged — skipping restart")
+		await _finish_with_existing_mounts()
+		return
+
+	if archive_paths.size() > 0:
+		_log_info("Preparing two-pass restart — %d archive(s)" % archive_paths.size())
+		if sections.prepend.size() > 0:
+			_log_info("  %d early autoload(s) in [autoload_prepend]" % sections.prepend.size())
+		_write_heartbeat()
+		var err := _write_override_cfg(sections.prepend)
+		if err != OK:
+			_log_critical("Failed to write override.cfg (error %d) — single-pass fallback" % err)
+			await _finish_single_pass()
+			return
+		if _write_pass_state(archive_paths, new_hash) != OK:
+			await _finish_single_pass()
+			return
+		OS.set_restart_on_exit(true, ["--", "--modloader-restart"])
+		get_tree().quit()
+		return
+
+	# No archives enabled. Clean up stale two-pass state if present.
+	if FileAccess.file_exists(PASS_STATE_PATH):
+		DirAccess.remove_absolute(ProjectSettings.globalize_path(PASS_STATE_PATH))
+		_restore_clean_override_cfg()
+	await _finish_single_pass()
+
+func _finish_with_existing_mounts() -> void:
+	for entry in _pending_autoloads:
+		if get_tree().root.has_node(entry["name"]):
+			_log_info("  Autoload '%s' already in tree — skipped" % entry["name"])
+			continue
+		_instantiate_autoload(entry["mod_name"], entry["name"], entry["path"])
+	if _developer_mode:
+		_log_override_timing_warnings()
+		_print_conflict_summary()
+		_write_conflict_report()
+	_delete_heartbeat()
+	if _file_scope_mounts > 0 or not _archive_file_sets.is_empty() or _pending_autoloads.size() > 0:
+		var err := get_tree().reload_current_scene()
+		if err != OK:
+			_log_critical("reload_current_scene() failed with error " + str(err))
+			return
+		if _developer_mode:
+			await get_tree().process_frame
+			_audit_override_instances()
+
+func _finish_single_pass() -> void:
 	for entry in _pending_autoloads:
 		_instantiate_autoload(entry["mod_name"], entry["name"], entry["path"])
 	if _developer_mode:
 		_log_override_timing_warnings()
 		_print_conflict_summary()
 		_write_conflict_report()
-	# Reload so mounted resource overrides and take_over_path() apply to the scene.
-	# Needed for ALL mods that replace files, not just those with autoloads.
+	_delete_heartbeat()
 	if not _archive_file_sets.is_empty() or _pending_autoloads.size() > 0:
-		var reload_err := get_tree().reload_current_scene()
-		if reload_err != OK:
-			_log_critical("reload_current_scene() failed with error " + str(reload_err))
+		var err := get_tree().reload_current_scene()
+		if err != OK:
+			_log_critical("reload_current_scene() failed with error " + str(err))
 			return
-		# Wait for the reloaded scene to be ready before auditing override instances.
-		# The modloader persists across reloads (it's an autoload), so this works.
 		if _developer_mode:
 			await get_tree().process_frame
 			_audit_override_instances()
 
+# Pass 2: Post-restart — archives already mounted at file-scope
+
+func _run_pass_2() -> void:
+	_log_info("Pass 2 — %d archive(s) mounted at file-scope" % _file_scope_mounts)
+	_clear_restart_counter()
+	_compile_regex()
+	_load_developer_mode_setting()
+	_ui_mod_entries = collect_mod_metadata()
+	_load_ui_config()
+
+	load_all_mods("Pass 2")
+	for entry in _pending_autoloads:
+		if get_tree().root.has_node(entry["name"]):
+			_log_info("  Autoload '%s' already in tree — skipped" % entry["name"])
+			continue
+		_instantiate_autoload(entry["mod_name"], entry["name"], entry["path"])
+
+	if _developer_mode:
+		_log_override_timing_warnings()
+		_print_conflict_summary()
+		_write_conflict_report()
+	_delete_heartbeat()
+	if _file_scope_mounts > 0 or not _archive_file_sets.is_empty() or _pending_autoloads.size() > 0:
+		var err := get_tree().reload_current_scene()
+		if err != OK:
+			_log_critical("reload_current_scene() failed with error " + str(err))
+			return
+		if _developer_mode:
+			await get_tree().process_frame
+			_audit_override_instances()
 
 func _compile_regex() -> void:
 	_re_take_over = RegEx.new()
@@ -105,10 +291,9 @@ func _compile_regex() -> void:
 	_re_filename_priority = RegEx.new()
 	_re_filename_priority.compile('^(-?\\d+)-(.*)')
 
+# Mod metadata collection (no mounting)
 
-# ─── Mod metadata collection (no mounting) ────────────────────────────────────
-
-func _collect_mod_metadata() -> Array[Dictionary]:
+func collect_mod_metadata() -> Array[Dictionary]:
 	var entries: Array[Dictionary] = []
 	_mods_dir = OS.get_executable_path().get_base_dir().path_join(MOD_DIR)
 	_log_info("Scanning mods dir: " + _mods_dir)
@@ -153,27 +338,22 @@ func _collect_mod_metadata() -> Array[Dictionary]:
 			_log_info("  " + e["file_name"] + " (" + e["mod_name"] + ")" + tag)
 	return entries
 
-
 func _build_archive_entry(mods_dir: String, file_name: String, ext: String) -> Dictionary:
 	var full_path := mods_dir.path_join(file_name)
 	if ext == "pck":
 		_last_mod_txt_status = "pck"
-	var cfg: ConfigFile = _read_mod_config(full_path) if ext != "pck" else null
+	var cfg: ConfigFile = read_mod_config(full_path) if ext != "pck" else null
 	var entry := _entry_from_config(cfg, file_name, full_path, ext)
 	entry["warnings"] = _build_entry_warnings(entry)
 	return entry
 
-
 func _build_folder_entry(mods_dir: String, dir_name: String) -> Dictionary:
 	var folder_path := mods_dir.path_join(dir_name)
-	var cfg: ConfigFile = _read_mod_config_folder(folder_path)
+	var cfg: ConfigFile = read_mod_config_folder(folder_path)
 	var entry := _entry_from_config(cfg, dir_name, folder_path, "folder")
 	entry["warnings"] = _build_entry_warnings(entry)
 	return entry
 
-
-# Future: mod.txt may support [mod] load_after = "other_mod_id" for soft dependencies.
-# This would feed into a topological sort pass before the priority/name sort.
 func _entry_from_config(cfg: ConfigFile, file_name: String, full_path: String, ext: String) -> Dictionary:
 	var mod_name := file_name
 	var mod_id   := file_name
@@ -213,7 +393,6 @@ func _entry_from_config(cfg: ConfigFile, file_name: String, full_path: String, e
 		entry["enabled"] = false
 	return entry
 
-
 func _build_entry_warnings(entry: Dictionary) -> Array[String]:
 	var warnings: Array[String] = []
 	var ext: String = entry["ext"]
@@ -231,8 +410,7 @@ func _build_entry_warnings(entry: Dictionary) -> Array[String]:
 		warnings.append("Invalid mod — packaged incorrectly. Try re-downloading.")
 	return warnings
 
-
-# ─── Config persistence ───────────────────────────────────────────────────────
+# Config persistence
 
 func _load_developer_mode_setting() -> void:
 	var cfg := ConfigFile.new()
@@ -241,7 +419,6 @@ func _load_developer_mode_setting() -> void:
 	_developer_mode = bool(cfg.get_value("settings", "developer_mode", false))
 	if _developer_mode:
 		_log_info("Developer mode: ON")
-
 
 func _load_ui_config() -> void:
 	var cfg := ConfigFile.new()
@@ -255,7 +432,6 @@ func _load_ui_config() -> void:
 		if cfg.has_section_key("priority", fn):
 			entry["priority"] = int(str(cfg.get_value("priority", fn)))
 
-
 func _save_ui_config() -> void:
 	var cfg := ConfigFile.new()
 	for entry in _ui_mod_entries:
@@ -265,10 +441,9 @@ func _save_ui_config() -> void:
 	cfg.set_value("settings", "developer_mode", _developer_mode)
 	cfg.save(UI_CONFIG_PATH)
 
+# UI
 
-# ─── UI ───────────────────────────────────────────────────────────────────────
-
-func _show_mod_ui() -> void:
+func show_mod_ui() -> void:
 	var win := Window.new()
 	win.title = "Road to Vostok — Mod Loader"
 	win.size = Vector2i(960, 640)
@@ -307,7 +482,7 @@ func _show_mod_ui() -> void:
 	margin.add_theme_constant_override("margin_top", 8)
 	margin.add_theme_constant_override("margin_bottom", 10)
 	margin.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
-	margin.theme = _make_dark_theme()
+	margin.theme = make_dark_theme()
 	win.add_child(margin)
 
 	var root := VBoxContainer.new()
@@ -358,19 +533,18 @@ func _show_mod_ui() -> void:
 	# Closing the window with X should behave the same as clicking Launch.
 	win.close_requested.connect(func(): launch_btn.pressed.emit())
 
-	var mods_tab := _build_mods_tab(tabs)
+	var mods_tab := build_mods_tab(tabs)
 	mods_tab.name = "Mods"
 	tabs.add_child(mods_tab)
 
-	var updates_tab := _build_updates_tab()
+	var updates_tab := build_updates_tab()
 	updates_tab.name = "Updates"
 	tabs.add_child(updates_tab)
 
 	await launch_btn.pressed
 	win.queue_free()
 
-
-func _make_dark_theme() -> Theme:
+func make_dark_theme() -> Theme:
 	var t := Theme.new()
 
 	const C_PANEL := Color(0.04, 0.04, 0.04)
@@ -462,8 +636,7 @@ func _make_dark_theme() -> Theme:
 
 	return t
 
-
-func _build_mods_tab(tabs: TabContainer) -> Control:
+func build_mods_tab(tabs: TabContainer) -> Control:
 	var outer := VBoxContainer.new()
 	outer.size_flags_vertical = Control.SIZE_EXPAND_FILL
 
@@ -492,13 +665,13 @@ func _build_mods_tab(tabs: TabContainer) -> Control:
 
 	dev_check.toggled.connect(func(on: bool):
 		_developer_mode = on
-		_ui_mod_entries = _collect_mod_metadata()
+		_ui_mod_entries = collect_mod_metadata()
 		_load_ui_config()
 		var old := tabs.get_node("Mods")
 		var idx := old.get_index()
 		tabs.remove_child(old)
 		old.queue_free()
-		var new_tab := _build_mods_tab(tabs)
+		var new_tab := build_mods_tab(tabs)
 		new_tab.name = "Mods"
 		tabs.add_child(new_tab)
 		tabs.move_child(new_tab, idx)
@@ -672,9 +845,7 @@ func _build_mods_tab(tabs: TabContainer) -> Control:
 	refresh_order.call()
 	return outer
 
-
-
-func _build_updates_tab() -> Control:
+func build_updates_tab() -> Control:
 	var margin := MarginContainer.new()
 	margin.add_theme_constant_override("margin_left", 8)
 	margin.add_theme_constant_override("margin_right", 8)
@@ -853,23 +1024,21 @@ func _build_updates_tab() -> Control:
 			btn.disabled = true
 			btn.mouse_filter = Control.MOUSE_FILTER_IGNORE
 			btn.text = "Download"
-		await _check_updates_for_ui(status_info, add_log, check_btn)
+		await check_updates_for_ui(status_info, add_log, check_btn)
 		check_btn.disabled = false
 		check_btn.text = "Check for Updates"
 	)
 
 	return margin
 
-
-
-func _check_updates_for_ui(status_info: Dictionary, add_log: Callable, check_btn: Button) -> void:
+func check_updates_for_ui(status_info: Dictionary, add_log: Callable, check_btn: Button) -> void:
 	var ids: Array[int] = []
 	for fn in status_info:
 		ids.append(status_info[fn]["mw_id"])
 	if ids.is_empty():
 		return
 
-	var latest := await _fetch_latest_modworkshop_versions(ids)
+	var latest := await fetch_latest_modworkshop_versions(ids)
 
 	if not is_instance_valid(check_btn):
 		return
@@ -884,7 +1053,7 @@ func _check_updates_for_ui(status_info: Dictionary, add_log: Callable, check_btn
 			lbl.modulate = Color(1.0, 1.0, 1.0)
 			continue
 
-		var cmp := _compare_versions(info["version"], str(latest_v))
+		var cmp := compare_versions(info["version"], str(latest_v))
 		if cmp >= 0:
 			# Local is same version or newer than what's on the server.
 			lbl.text = "up to date"
@@ -908,8 +1077,10 @@ func _check_updates_for_ui(status_info: Dictionary, add_log: Callable, check_btn
 				dl_btn.text = "Downloading..."
 				lbl.text = "downloading..."
 				check_btn.disabled = true
-				var ok := await _download_and_replace_mod(full_path, mw_id)
+				var ok := await download_and_replace_mod(full_path, mw_id)
 				if not is_instance_valid(check_btn):
+					return
+				if not is_instance_valid(dl_btn):
 					return
 				check_btn.disabled = false
 				if ok:
@@ -931,10 +1102,9 @@ func _check_updates_for_ui(status_info: Dictionary, add_log: Callable, check_btn
 					add_log.call(mod_name + " — download failed.")
 			)
 
+# Main load loop
 
-# ─── Main load loop ───────────────────────────────────────────────────────────
-
-func _load_all_mods() -> void:
+func load_all_mods(pass_label: String = "") -> void:
 	_pending_autoloads.clear()
 	_loaded_mod_ids.clear()
 	_registered_autoload_names.clear()
@@ -946,7 +1116,6 @@ func _load_all_mods() -> void:
 
 	DirAccess.make_dir_recursive_absolute(ProjectSettings.globalize_path(TMP_DIR))
 
-	# Build the candidate list from UI-configured entries (already filtered and trusted).
 	var candidates: Array[Dictionary] = []
 	for entry in _ui_mod_entries:
 		if not entry["enabled"]:
@@ -968,16 +1137,16 @@ func _load_all_mods() -> void:
 					+ "' and '" + candidates[i]["file_name"]
 					+ "'. Load order tie broken by archive filename.")
 
-	_log_info("=== Load Order ===")
+	var header := "=== Load Order" + (" (" + pass_label + ")" if pass_label != "" else "") + " ==="
+	_log_info(header)
 	for i in candidates.size():
 		var c: Dictionary = candidates[i]
 		_log_info("  [" + str(i + 1) + "] " + c["mod_name"] + " | " + c["file_name"]
 				+ " [priority=" + str(c["priority"]) + "]")
-	_log_info("==================")
+	_log_info("=" .repeat(header.length()))
 
 	for load_index in candidates.size():
 		_process_mod_candidate(candidates[load_index], load_index)
-
 
 func _process_mod_candidate(c: Dictionary, load_index: int) -> void:
 	var file_name: String = c["file_name"]
@@ -999,7 +1168,7 @@ func _process_mod_candidate(c: Dictionary, load_index: int) -> void:
 
 	var mount_path := full_path
 	if ext == "folder":
-		mount_path = _zip_folder_to_temp(full_path)
+		mount_path = zip_folder_to_temp(full_path)
 		if mount_path == "":
 			_log_critical("Failed to zip folder: " + file_name)
 			return
@@ -1013,19 +1182,7 @@ func _process_mod_candidate(c: Dictionary, load_index: int) -> void:
 
 	if ext != "pck":
 		var scan_path := mount_path if ext == "folder" else full_path
-		_scan_and_register_archive_claims(scan_path, mod_name, file_name, load_index)
-		# Verify mount actually worked — check if at least one file is accessible.
-		# Debug-only: FileAccess/ResourceLoader checks are unreliable for mounted
-		# archives on some systems, so this is diagnostic info, not an error.
-		if _developer_mode and _archive_file_sets.has(file_name):
-			var verified := false
-			for res_path: String in _archive_file_sets[file_name]:
-				if FileAccess.file_exists(res_path) or ResourceLoader.exists(res_path):
-					verified = true
-					break
-			if not verified and _archive_file_sets[file_name].size() > 0:
-				_log_debug("  Mount verification: no files accessible via FileAccess/ResourceLoader (may be normal)")
-				_log_debug("  Will attempt load() directly when needed")
+		scan_and_register_archive_claims(scan_path, mod_name, file_name, load_index)
 
 	if ext == "pck" or cfg == null:
 		if cfg == null and ext != "pck":
@@ -1046,8 +1203,11 @@ func _process_mod_candidate(c: Dictionary, load_index: int) -> void:
 	var keys: PackedStringArray = cfg.get_section_keys("autoload")
 	for key in keys:
 		var autoload_name := str(key)
-		# Strip Godot autoload prefix (*) and VostokMods early-autoload prefix (!).
-		var res_path := str(cfg.get_value("autoload", key)).lstrip("*!").strip_edges()
+		var raw_path := str(cfg.get_value("autoload", key)).lstrip("*").strip_edges()
+		var is_early := raw_path.begins_with("!")
+		if is_early:
+			raw_path = raw_path.lstrip("!")
+		var res_path := raw_path
 
 		if res_path == "":
 			_log_warning("  Empty autoload path for '" + autoload_name + "' — skipped")
@@ -1071,30 +1231,30 @@ func _process_mod_candidate(c: Dictionary, load_index: int) -> void:
 				_log_critical("    Similar paths in archive: " + ", ".join(similar))
 			continue
 
-		_pending_autoloads.append({ "mod_name": mod_name, "name": autoload_name, "path": res_path })
-		_log_info("  Autoload queued: " + autoload_name + " -> " + res_path)
+		_pending_autoloads.append({
+			"mod_name": mod_name, "name": autoload_name, "path": res_path,
+			"is_early": is_early,
+		})
+		var early_tag := " [EARLY]" if is_early else ""
+		_log_info("  Autoload queued: " + autoload_name + " -> " + res_path + early_tag)
 		_register_claim(res_path, mod_name, file_name, load_index)
 
-
-# ─── Logging ──────────────────────────────────────────────────────────────────
+# Logging
 
 func _log_info(msg: String) -> void:
 	var line := "[ModLoader][Info] " + msg
 	print(line)
 	_report_lines.append(line)
 
-
 func _log_warning(msg: String) -> void:
 	var line := "[ModLoader][Warning] " + msg
 	push_warning(line)
 	_report_lines.append(line)
 
-
 func _log_critical(msg: String) -> void:
 	var line := "[ModLoader][Critical] " + msg
 	push_error(line)
 	_report_lines.append(line)
-
 
 func _log_debug(msg: String) -> void:
 	if not _developer_mode:
@@ -1103,8 +1263,7 @@ func _log_debug(msg: String) -> void:
 	print(line)
 	_report_lines.append(line)
 
-
-# ─── Override registry ────────────────────────────────────────────────────────
+# Override registry
 
 func _register_claim(res_path: String, mod_name: String, archive: String,
 		load_index: int) -> void:
@@ -1124,15 +1283,12 @@ func _compare_load_order(a: Dictionary, b: Dictionary) -> bool:
 	var b_name := (b["mod_name"] as String).to_lower()
 	if a_name != b_name:
 		return a_name < b_name
-	# file_name is the archive's disk filename — guaranteed unique by the filesystem.
-	# This final tiebreaker makes the ordering a strict total order so that Godot's
-	# unstable introsort can never shuffle "equal" elements.
+	# Filename tiebreaker for stable sort.
 	return (a["file_name"] as String).to_lower() < (b["file_name"] as String).to_lower()
 
+# Archive scanner
 
-# ─── Archive scanner ──────────────────────────────────────────────────────────
-
-func _scan_and_register_archive_claims(archive_path: String, mod_name: String,
+func scan_and_register_archive_claims(archive_path: String, mod_name: String,
 		archive_file: String, load_index: int) -> void:
 	var zr := ZIPReader.new()
 	if zr.open(archive_path) != OK:
@@ -1174,7 +1330,9 @@ func _scan_and_register_archive_claims(archive_path: String, mod_name: String,
 		if f.get_extension().to_lower() == "gd":
 			gd_analysis["total_gd_files"] = gd_analysis["total_gd_files"] + 1
 			if _developer_mode:
-				_scan_gd_source(zr.read_file(f).get_string_from_utf8(), gd_analysis)
+				var gd_bytes := zr.read_file(f)
+				if gd_bytes.size() > 0:
+					_scan_gd_source(gd_bytes.get_string_from_utf8(), gd_analysis)
 
 		var res_path := _normalize_to_res_path(f)
 		if res_path == "":
@@ -1208,7 +1366,6 @@ func _scan_and_register_archive_claims(archive_path: String, mod_name: String,
 		_log_info("  " + str(gd_analysis["total_gd_files"]) + " .gd file(s), "
 				+ str(override_count) + " override target(s)" + dynamic_tag)
 
-
 func _normalize_to_res_path(zip_path: String) -> String:
 	var path := zip_path.replace("\\", "/")
 	if path.begins_with("res://"):   return path
@@ -1218,8 +1375,7 @@ func _normalize_to_res_path(zip_path: String) -> String:
 		return "res://" + path
 	return ""
 
-
-# ─── GDScript source analysis ─────────────────────────────────────────────────
+# GDScript source analysis
 
 func _scan_gd_source(text: String, analysis: Dictionary) -> void:
 	for m in _re_take_over.search_all(text):
@@ -1259,15 +1415,13 @@ func _scan_gd_source(text: String, analysis: Dictionary) -> void:
 	if not analysis["calls_base"]:
 		analysis["calls_base"] = "base(" in text
 
-	# Collect preload() paths for stale-cache detection.
+	# preload() paths — used for stale-cache detection.
 	for m_pl in _re_preload.search_all(text):
 		var pl_path := m_pl.get_string(1)
 		if pl_path not in (analysis["preload_paths"] as Array):
 			(analysis["preload_paths"] as Array).append(pl_path)
 
-	# Collect ALL method declarations. If this file extends a vanilla script,
-	# track which methods it overrides — this is the key data for method-level
-	# collision detection between mods.
+	# Method declarations — needed for mod collision detection.
 	var func_matches := _re_func.search_all(text)
 
 	# Determine the extends target for this file (if any).
@@ -1286,9 +1440,7 @@ func _scan_gd_source(text: String, analysis: Dictionary) -> void:
 			if func_name not in method_list:
 				method_list.append(func_name)
 
-		# Check lifecycle methods for super(). Missing it breaks the override chain.
-		# Only flag scripts that extend a game script (res:// path). Standalone
-		# autoloads (extends Node, etc.) don't participate in override chains.
+		# Warn if lifecycle methods lack super() in scripts that extend game scripts.
 		if ext_target == "":
 			continue
 		if func_name not in LIFECYCLE_METHODS:
@@ -1301,13 +1453,9 @@ func _scan_gd_source(text: String, analysis: Dictionary) -> void:
 			if func_name not in (analysis["lifecycle_no_super"] as Array):
 				(analysis["lifecycle_no_super"] as Array).append(func_name)
 
+# Override diagnostics (developer mode)
 
-
-# ─── Override diagnostics (developer mode) ───────────────────────────────────
-
-# Logs a timing note for each mod that uses overrideScript(). Runs after
-# autoloads have been instantiated — by this point the override is registered
-# but the scene hasn't reloaded yet, so existing nodes still have the old script.
+# Log which mods use overrideScript() — overrides apply after scene reload.
 func _log_override_timing_warnings() -> void:
 	for mod_name: String in _mod_script_analysis:
 		var analysis: Dictionary = _mod_script_analysis[mod_name]
@@ -1320,10 +1468,7 @@ func _log_override_timing_warnings() -> void:
 		_log_debug(mod_name + " uses overrideScript() on: " + target_list
 				+ " — applies after scene reload")
 
-
-# Walks the scene tree after reload and checks whether any live node's script
-# matches a known override target. Logs a warning for targets with zero matching
-# instances — the most common "mod does nothing" silent-failure case.
+# After reload, do any live nodes actually match the override targets?
 func _audit_override_instances() -> void:
 	var override_targets: Dictionary = {}  # res_path -> mod_name
 	for mod_name: String in _mod_script_analysis:
@@ -1349,9 +1494,7 @@ func _audit_override_instances() -> void:
 			_log_debug("Override registered but 0 nodes use " + target_path.get_file()
 					+ " in current scene — likely spawned at runtime [" + mod_name + "]")
 
-
 func _collect_live_scripts(root_node: Node, out: Dictionary) -> void:
-	# Iterative traversal to avoid stack overflow on deeply nested scene trees.
 	var stack: Array[Node] = [root_node]
 	while not stack.is_empty():
 		var node: Node = stack.pop_back()
@@ -1362,8 +1505,202 @@ func _collect_live_scripts(root_node: Node, out: Dictionary) -> void:
 				out[path] = (out.get(path, 0) as int) + 1
 		stack.append_array(node.get_children())
 
+# Two-pass helpers
 
-# ─── Conflict summary ─────────────────────────────────────────────────────────
+func _build_autoload_sections() -> Dictionary:
+	var prepend: Array[Dictionary] = []
+	var append: Array[Dictionary] = []
+	for entry in _pending_autoloads:
+		if entry.get("is_early", false):
+			prepend.append({ "name": entry["name"], "path": entry["path"] })
+		else:
+			append.append({ "name": entry["name"], "path": entry["path"] })
+	return { "prepend": prepend, "append": append }
+
+func _collect_enabled_archive_paths() -> PackedStringArray:
+	var paths := PackedStringArray()
+	var candidates: Array[Dictionary] = []
+	for entry in _ui_mod_entries:
+		if not entry["enabled"]:
+			continue
+		candidates.append(entry.duplicate())
+	candidates.sort_custom(_compare_load_order)
+	for c in candidates:
+		if c["ext"] == "zip":
+			continue
+		paths.append(c["full_path"])
+	return paths
+
+# Reads override.cfg and returns lines for sections OTHER than [autoload] and
+# [autoload_prepend]. Used to preserve user/game settings when rewriting.
+static func _read_preserved_cfg_sections(cfg_path: String) -> String:
+	if not FileAccess.file_exists(cfg_path):
+		return ""
+	var f := FileAccess.open(cfg_path, FileAccess.READ)
+	if f == null:
+		return ""
+	var text := f.get_as_text()
+	f.close()
+	var result := PackedStringArray()
+	var in_autoload_section := false
+	for line in text.split("\n"):
+		var stripped := line.strip_edges()
+		if stripped.begins_with("["):
+			var section := stripped.to_lower()
+			in_autoload_section = section == "[autoload]" or section == "[autoload_prepend]"
+			if not in_autoload_section:
+				result.append(line)
+			continue
+		if not in_autoload_section and stripped != "":
+			result.append(line)
+	var preserved := "\n".join(result).strip_edges()
+	if preserved.is_empty():
+		return ""
+	return "\n" + preserved + "\n"
+
+# Uses FileAccess instead of ConfigFile (which erases null keys).
+# ModLoader listed last in [autoload_prepend] = loaded first (reverse insertion).
+func _write_override_cfg(prepend_autoloads: Array[Dictionary]) -> Error:
+	var exe_dir := OS.get_executable_path().get_base_dir()
+	var path := exe_dir.path_join("override.cfg")
+	var tmp := path + ".tmp"
+	var preserved := _read_preserved_cfg_sections(path)
+	var lines := PackedStringArray()
+	if prepend_autoloads.size() > 0:
+		lines.append("[autoload_prepend]")
+		for entry in prepend_autoloads:
+			lines.append('%s="*%s"' % [entry["name"], entry["path"]])
+		lines.append('ModLoader="*' + MODLOADER_RES_PATH + '"')
+		lines.append("")
+	lines.append("[autoload]")
+	if prepend_autoloads.is_empty():
+		lines.append('ModLoader="*' + MODLOADER_RES_PATH + '"')
+	lines.append("")
+	var f := FileAccess.open(tmp, FileAccess.WRITE)
+	if f == null:
+		return FileAccess.get_open_error()
+	f.store_string("\n".join(lines) + "\n" + preserved)
+	f.close()
+	# Windows DirAccess.rename() won't overwrite — remove target first.
+	if FileAccess.file_exists(path):
+		DirAccess.remove_absolute(path)
+	var dir := DirAccess.open(exe_dir)
+	if dir == null:
+		DirAccess.remove_absolute(tmp)
+		return ERR_CANT_OPEN
+	var err := dir.rename(tmp.get_file(), path.get_file())
+	if err != OK:
+		DirAccess.remove_absolute(tmp)
+	return err
+
+func _write_pass_state(archive_paths: PackedStringArray, state_hash: String = "") -> Error:
+	var cfg := ConfigFile.new()
+	cfg.load(PASS_STATE_PATH)
+	var count: int = cfg.get_value("state", "restart_count", 0)
+	cfg.set_value("state", "restart_count", count + 1)
+	cfg.set_value("state", "mods_hash", state_hash)
+	cfg.set_value("state", "archive_paths", archive_paths)
+	cfg.set_value("state", "modloader_version", MODLOADER_VERSION)
+	cfg.set_value("state", "timestamp", Time.get_unix_time_from_system())
+	var err := cfg.save(PASS_STATE_PATH)
+	if err != OK:
+		_log_critical("Failed to save pass state (error %d)" % err)
+	return err
+
+func _compute_state_hash(archive_paths: PackedStringArray, prepend_autoloads: Array[Dictionary]) -> String:
+	if archive_paths.is_empty() and prepend_autoloads.is_empty():
+		return ""
+	var parts := PackedStringArray()
+	var sorted_paths := Array(archive_paths)
+	sorted_paths.sort()
+	for p in sorted_paths:
+		# Include mtime so replacing a file with the same name triggers a restart.
+		parts.append("a:%s@%d" % [p, FileAccess.get_modified_time(p)])
+	for entry in prepend_autoloads:
+		parts.append("p:%s=%s" % [entry["name"], entry["path"]])
+	for entry in _ui_mod_entries:
+		if entry["enabled"] and entry.get("cfg") != null:
+			var ver: String = (entry["cfg"] as ConfigFile).get_value("mod", "version", "")
+			if not ver.is_empty():
+				parts.append("v:%s=%s" % [entry["mod_id"], ver])
+	return "\n".join(parts).md5_text()
+
+func _write_heartbeat() -> void:
+	var f := FileAccess.open(HEARTBEAT_PATH, FileAccess.WRITE)
+	if f:
+		f.store_string("started:%d" % Time.get_unix_time_from_system())
+		f.close()
+
+func _delete_heartbeat() -> void:
+	if FileAccess.file_exists(HEARTBEAT_PATH):
+		DirAccess.remove_absolute(ProjectSettings.globalize_path(HEARTBEAT_PATH))
+
+func _check_crash_recovery() -> void:
+	if not FileAccess.file_exists(HEARTBEAT_PATH):
+		return
+	_log_warning("Heartbeat detected — previous launch may have crashed")
+	var cfg := ConfigFile.new()
+	if cfg.load(PASS_STATE_PATH) == OK:
+		var count: int = cfg.get_value("state", "restart_count", 0)
+		if count >= MAX_RESTART_COUNT:
+			_log_critical("Restart loop (%d crashes) — resetting to clean state" % count)
+			_restore_clean_override_cfg()
+			DirAccess.remove_absolute(ProjectSettings.globalize_path(PASS_STATE_PATH))
+			_delete_heartbeat()
+			return
+	_delete_heartbeat()
+
+func _check_safe_mode() -> void:
+	var exe_dir := OS.get_executable_path().get_base_dir()
+	var safe_path := exe_dir.path_join(SAFE_MODE_FILE)
+	if not FileAccess.file_exists(safe_path):
+		return
+	_log_warning("Safe mode file detected — resetting to clean state")
+	_restore_clean_override_cfg()
+	if FileAccess.file_exists(PASS_STATE_PATH):
+		DirAccess.remove_absolute(ProjectSettings.globalize_path(PASS_STATE_PATH))
+	_delete_heartbeat()
+	DirAccess.remove_absolute(safe_path)
+
+func _clean_stale_cache() -> void:
+	# Remove cached zips whose source .vmz no longer exists in the mods folder.
+	var cache_dir := ProjectSettings.globalize_path(TMP_DIR)
+	if not DirAccess.dir_exists_absolute(cache_dir):
+		return
+	var dir := DirAccess.open(cache_dir)
+	if dir == null:
+		return
+	dir.list_dir_begin()
+	while true:
+		var fname := dir.get_next()
+		if fname == "":
+			break
+		if fname.get_extension().to_lower() != "zip":
+			continue
+		var vmz_name := fname.get_basename() + ".vmz"
+		if not FileAccess.file_exists(_mods_dir.path_join(vmz_name)):
+			DirAccess.remove_absolute(cache_dir.path_join(fname))
+			_log_debug("Removed stale cache: " + fname)
+	dir.list_dir_end()
+
+func _restore_clean_override_cfg() -> void:
+	var exe_dir := OS.get_executable_path().get_base_dir()
+	var path := exe_dir.path_join("override.cfg")
+	var preserved := _read_preserved_cfg_sections(path)
+	var f := FileAccess.open(path, FileAccess.WRITE)
+	if f == null:
+		_log_critical("Cannot write override.cfg — game dir may be read-only: " + exe_dir)
+		return
+	f.store_string("[autoload]\nModLoader=\"*" + MODLOADER_RES_PATH + "\"\n" + preserved)
+	f.close()
+
+func _clear_restart_counter() -> void:
+	var cfg := ConfigFile.new()
+	if cfg.load(PASS_STATE_PATH) == OK:
+		cfg.set_value("state", "restart_count", 0)
+		cfg.save(PASS_STATE_PATH)
+
+# Conflict summary
 
 func _print_conflict_summary() -> void:
 	_log_info("")
@@ -1397,7 +1734,6 @@ func _print_conflict_summary() -> void:
 	_log_info("============================================")
 	_log_info("")
 
-
 func _write_conflict_report() -> void:
 	var f := FileAccess.open(CONFLICT_REPORT_PATH, FileAccess.WRITE)
 	if f == null:
@@ -1408,29 +1744,17 @@ func _write_conflict_report() -> void:
 	f.close()
 	_log_info("Conflict report written to: " + CONFLICT_REPORT_PATH)
 
-
-# ─── Autoload instantiation ───────────────────────────────────────────────────
+# Autoload instantiation
 
 func _instantiate_autoload(mod_name: String, autoload_name: String, res_path: String) -> void:
-	# Neither FileAccess.file_exists() nor ResourceLoader.exists() is reliable for
-	# files in mounted archives across all systems. Try load() directly and use the
-	# existence checks only for diagnostics when load() fails.
 	var resource: Resource = load(res_path)
 	if resource == null:
-		var fa := FileAccess.file_exists(res_path)
-		var rl := ResourceLoader.exists(res_path)
-		_log_critical("Autoload failed: " + autoload_name + " -> " + res_path + " [" + mod_name + "]")
-		_log_critical("  FileAccess.file_exists=" + str(fa) + "  ResourceLoader.exists=" + str(rl))
-		if not fa and not rl:
-			_log_critical("  File not accessible after mounting. Possible causes:")
-			_log_critical("    - Windows backslash paths in zip (re-pack with 7-Zip)")
-			_log_critical("    - Archive failed to mount (check for earlier errors)")
-			_log_critical("    - Path in mod.txt doesn't match actual file path in archive")
-		else:
-			_log_critical("  File exists but failed to parse. Check the Godot log above.")
+		_log_critical("Autoload failed: %s -> %s [%s]" % [autoload_name, res_path, mod_name])
+		if _developer_mode:
+			_log_debug("  FileAccess=%s  ResourceLoader=%s"
+					% [str(FileAccess.file_exists(res_path)), str(ResourceLoader.exists(res_path))])
 		return
 
-	# Add to root so mods can find autoloads at /root/<name>, matching real autoload behavior.
 	if get_tree().root.has_node(autoload_name):
 		_log_warning("Autoload name '" + autoload_name + "' conflicts with existing node at /root/"
 				+ autoload_name + " — Godot will rename it. [" + mod_name + "]")
@@ -1469,37 +1793,25 @@ func _instantiate_autoload(mod_name: String, autoload_name: String, res_path: St
 	_log_warning("Autoload is not a PackedScene or GDScript: " + autoload_name
 			+ " -> " + res_path + " [" + mod_name + "]")
 
-
-# ─── Mount helper ─────────────────────────────────────────────────────────────
+# Mount helper
 
 func _try_mount_pack(path: String) -> bool:
 	if ProjectSettings.load_resource_pack(path):
 		return true
 	if path.get_extension().to_lower() != "vmz":
 		return false
-	# VMZ files are renamed zips — copy to a real .zip path so Godot can open them.
-	var temp_zip := ProjectSettings.globalize_path(TMP_DIR).path_join(
-			path.get_file().get_basename() + ".zip")
-	var data := FileAccess.get_file_as_bytes(path)
-	if data.size() == 0:
-		return false
-	var out := FileAccess.open(temp_zip, FileAccess.WRITE)
-	if out == null:
-		return false
-	out.store_buffer(data)
-	out.close()
-	return ProjectSettings.load_resource_pack(temp_zip)
+	var zip_path := _static_vmz_to_zip(path)
+	return not zip_path.is_empty() and ProjectSettings.load_resource_pack(zip_path)
 
+# mod.txt parser
 
-# ─── mod.txt parser ───────────────────────────────────────────────────────────
-
-func _read_mod_config(path: String) -> ConfigFile:
+func read_mod_config(path: String) -> ConfigFile:
 	_last_mod_txt_status = "none"
 	var zr := ZIPReader.new()
 	if zr.open(path) != OK:
 		return null
 	if not zr.file_exists("mod.txt"):
-		# Scan for nested mod.txt (e.g. "SubFolder/mod.txt").
+		# Nested mod.txt (e.g. "SubFolder/mod.txt") means bad packaging.
 		for f: String in zr.get_files():
 			if f.get_file() == "mod.txt":
 				_last_mod_txt_status = "nested:" + f
@@ -1507,8 +1819,12 @@ func _read_mod_config(path: String) -> ConfigFile:
 				return null
 		zr.close()
 		return null
-	var text := zr.read_file("mod.txt").get_string_from_utf8()
+	var raw := zr.read_file("mod.txt")
 	zr.close()
+	if raw.size() == 0:
+		_last_mod_txt_status = "parse_error"
+		return null
+	var text := raw.get_string_from_utf8()
 	var cfg := _parse_mod_txt(text)
 	if cfg == null:
 		_last_mod_txt_status = "parse_error"
@@ -1516,8 +1832,7 @@ func _read_mod_config(path: String) -> ConfigFile:
 	_last_mod_txt_status = "ok"
 	return cfg
 
-
-func _read_mod_config_folder(folder_path: String) -> ConfigFile:
+func read_mod_config_folder(folder_path: String) -> ConfigFile:
 	_last_mod_txt_status = "none"
 	var mod_txt_path := folder_path.path_join("mod.txt")
 	if not FileAccess.file_exists(mod_txt_path):
@@ -1534,7 +1849,6 @@ func _read_mod_config_folder(folder_path: String) -> ConfigFile:
 	_last_mod_txt_status = "ok"
 	return cfg
 
-
 func _parse_mod_txt(text: String) -> ConfigFile:
 	if text.begins_with("\uFEFF"):
 		text = text.substr(1)
@@ -1543,10 +1857,9 @@ func _parse_mod_txt(text: String) -> ConfigFile:
 		return null
 	return cfg
 
+# Folder → temp zip (developer mode)
 
-# ─── Folder → temp zip (developer mode) ──────────────────────────────────────
-
-func _zip_folder_to_temp(folder_path: String) -> String:
+func zip_folder_to_temp(folder_path: String) -> String:
 	var folder_name := folder_path.get_file()
 	var tmp_zip_path := ProjectSettings.globalize_path(TMP_DIR).path_join(
 			folder_name + "_dev.zip")
@@ -1559,7 +1872,6 @@ func _zip_folder_to_temp(folder_path: String) -> String:
 	_zip_folder_recursive(zp, folder_path, "")
 	zp.close()
 	return tmp_zip_path
-
 
 func _zip_folder_recursive(zp: ZIPPacker, disk_path: String, archive_prefix: String) -> void:
 	var dir := DirAccess.open(disk_path)
@@ -1583,24 +1895,25 @@ func _zip_folder_recursive(zp: ZIPPacker, disk_path: String, archive_prefix: Str
 			zp.close_file()
 	dir.list_dir_end()
 
+# Update fetch helpers
 
-# ─── Update fetch helpers ─────────────────────────────────────────────────────
-
-# Compares two dotted version strings. Returns -1 if a < b, 0 if equal, 1 if a > b.
-# "0.0.2" vs "0.0.1" → 1 (local is newer, no update needed).
-func _compare_versions(a: String, b: String) -> int:
+# Returns -1/0/1 for version comparison (a < b, equal, a > b).
+func compare_versions(a: String, b: String) -> int:
+	if a.is_empty() or b.is_empty():
+		return 0 if a == b else (-1 if a.is_empty() else 1)
 	var pa := a.lstrip("vV").split(".")
 	var pb := b.lstrip("vV").split(".")
 	var n := max(pa.size(), pb.size())
 	for i in n:
-		var va := int(pa[i]) if i < pa.size() else 0
-		var vb := int(pb[i]) if i < pb.size() else 0
+		var sa := pa[i] if i < pa.size() else "0"
+		var sb := pb[i] if i < pb.size() else "0"
+		var va := int(sa) if sa.is_valid_int() else 0
+		var vb := int(sb) if sb.is_valid_int() else 0
 		if va < vb: return -1
 		if va > vb: return 1
 	return 0
 
-
-func _fetch_latest_modworkshop_versions(ids: Array[int]) -> Dictionary:
+func fetch_latest_modworkshop_versions(ids: Array[int]) -> Dictionary:
 	var latest_versions := {}
 	for chunk_ids in _chunk_int_array(ids, MODWORKSHOP_BATCH_SIZE):
 		var req := HTTPRequest.new()
@@ -1612,7 +1925,7 @@ func _fetch_latest_modworkshop_versions(ids: Array[int]) -> Dictionary:
 		if err != OK:
 			req.queue_free()
 			continue
-		# request_completed → [result, http_code, headers, body]
+
 		var res: Array = await req.request_completed
 		req.queue_free()
 		if res[0] != HTTPRequest.RESULT_SUCCESS or res[1] < 200 or res[1] >= 300:
@@ -1622,8 +1935,7 @@ func _fetch_latest_modworkshop_versions(ids: Array[int]) -> Dictionary:
 			latest_versions.merge(parsed, true)
 	return latest_versions
 
-
-func _download_and_replace_mod(target_path: String, modworkshop_id: int) -> bool:
+func download_and_replace_mod(target_path: String, modworkshop_id: int) -> bool:
 	var req := HTTPRequest.new()
 	req.timeout = API_DOWNLOAD_TIMEOUT
 	req.download_body_size_limit = 256 * 1024 * 1024
@@ -1653,7 +1965,7 @@ func _download_and_replace_mod(target_path: String, modworkshop_id: int) -> bool
 	out.store_buffer(response_body)
 	out.close()
 
-	if _read_mod_config(temp_path) == null:
+	if read_mod_config(temp_path) == null:
 		DirAccess.remove_absolute(temp_path)
 		return false
 
@@ -1676,7 +1988,6 @@ func _download_and_replace_mod(target_path: String, modworkshop_id: int) -> bool
 	if FileAccess.file_exists(backup_path):
 		DirAccess.remove_absolute(backup_path)
 	return true
-
 
 func _chunk_int_array(arr: Array[int], chunk_size: int) -> Array:
 	var result: Array = []
