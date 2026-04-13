@@ -63,7 +63,6 @@ Delete `override.cfg` and `modloader.gd` from the game folder. The `mods` folder
 Settings are stored in `%APPDATA%\Road to Vostok\mod_config.cfg` and can be deleted safely.
 
 ---
----
 
 # For Mod Authors
 

@@ -146,8 +146,6 @@ func _ready() -> void:
 	if _has_loaded:
 		return
 	_has_loaded = true
-	if has_meta("_file_scope_mounts"):
-		_file_scope_mounts = get_meta("_file_scope_mounts")
 	await get_tree().process_frame
 	if "--modloader-restart" in OS.get_cmdline_user_args():
 		_run_pass_2()
@@ -222,6 +220,10 @@ func _finish_with_existing_mounts() -> void:
 		var err := get_tree().reload_current_scene()
 		if err != OK:
 			_log_critical("reload_current_scene() failed with error " + str(err))
+			return
+		if _developer_mode:
+			await get_tree().process_frame
+			_audit_override_instances()
 
 func _finish_single_pass() -> void:
 	for entry in _pending_autoloads:
@@ -1862,7 +1864,6 @@ func _zip_folder_recursive(zp: ZIPPacker, disk_path: String, archive_prefix: Str
 
 # Update fetch helpers
 
-# Returns -1/0/1 for version comparison (a < b, equal, a > b).
 # Returns -1/0/1 for version comparison (a < b, equal, a > b).
 func compare_versions(a: String, b: String) -> int:
 	if a.is_empty() or b.is_empty():
