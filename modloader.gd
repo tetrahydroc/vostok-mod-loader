@@ -15,6 +15,10 @@ const HEARTBEAT_PATH := "user://modloader_heartbeat.txt"
 const SAFE_MODE_FILE := "modloader_safe_mode"
 const MAX_RESTART_COUNT := 2
 
+const HOOK_PACK_DIR := "user://modloader_hooks"
+const HOOK_PACK_PATH := "user://modloader_hooks/hook-pack.zip"
+const VANILLA_CACHE_DIR := "user://modloader_hooks/vanilla"
+
 const MODWORKSHOP_VERSIONS_URL := "https://api.modworkshop.net/mods/versions"
 const MODWORKSHOP_DOWNLOAD_URL_TEMPLATE := "https://api.modworkshop.net/mods/%s/download"
 const MODWORKSHOP_BATCH_SIZE := 100
@@ -44,6 +48,12 @@ var _override_registry: Dictionary = {}
 var _mod_script_analysis: Dictionary = {}
 var _archive_file_sets: Dictionary = {}
 
+# Hook system state
+var _hook_registry: Dictionary = {}       # "res://path.gd::method" -> { before: [Callable], after: [Callable] }
+var _hook_script_paths: Dictionary = {}   # "res://path.gd" -> true  (scripts that need hook-pack entries)
+var _class_name_to_path: Dictionary = {}  # "Camera" -> "res://Scripts/Camera.gd"
+var _hook_call_depth: Dictionary = {}     # "res://path.gd::method" -> int  (reentrancy guard)
+
 var _re_take_over: RegEx
 var _re_extends: RegEx
 var _re_extends_classname: RegEx
@@ -57,17 +67,39 @@ var _re_filename_priority: RegEx
 var _file_scope_mounts: int = _mount_previous_session()
 
 static func _mount_previous_session() -> int:
+	var log_lines: PackedStringArray = []
+	log_lines.append("[FileScope] _mount_previous_session() starting")
+
 	var cfg := ConfigFile.new()
 	if cfg.load(PASS_STATE_PATH) != OK:
+		log_lines.append("[FileScope] No pass state file — skipping")
+		_write_filescope_log(log_lines)
 		return 0
 	# Wipe stale state from a different modloader version (format may have changed).
 	var saved_ver: String = cfg.get_value("state", "modloader_version", "")
 	if saved_ver != MODLOADER_VERSION:
+		log_lines.append("[FileScope] Version mismatch: saved=%s current=%s — wiping" % [saved_ver, MODLOADER_VERSION])
 		DirAccess.remove_absolute(ProjectSettings.globalize_path(PASS_STATE_PATH))
+		_write_filescope_log(log_lines)
 		return 0
+	# Detect game updates — exe mtime change means vanilla scripts may have changed.
+	var saved_exe_mtime: int = cfg.get_value("state", "exe_mtime", 0)
+	if saved_exe_mtime != 0:
+		var current_exe_mtime := FileAccess.get_modified_time(OS.get_executable_path())
+		if current_exe_mtime != saved_exe_mtime:
+			log_lines.append("[FileScope] Game exe mtime changed — wiping hook cache")
+			# Game updated — wipe hook cache so Pass 1 regenerates from fresh vanilla.
+			_static_wipe_hook_cache()
+			DirAccess.remove_absolute(ProjectSettings.globalize_path(PASS_STATE_PATH))
+			_write_filescope_log(log_lines)
+			return 0
 	var paths: PackedStringArray = cfg.get_value("state", "archive_paths", PackedStringArray())
 	if paths.is_empty():
+		log_lines.append("[FileScope] Pass state has no archive paths — skipping")
+		_write_filescope_log(log_lines)
 		return 0
+
+	log_lines.append("[FileScope] %d archive path(s) in pass state" % paths.size())
 
 	# Were any archives deleted since last session?
 	var any_missing := false
@@ -76,17 +108,21 @@ static func _mount_previous_session() -> int:
 		var abs_path := path if not path.begins_with("res://") and not path.begins_with("user://") \
 				else ProjectSettings.globalize_path(path)
 		if FileAccess.file_exists(abs_path):
+			log_lines.append("[FileScope]   EXISTS: " + abs_path)
 			continue
 		# VMZ source gone — check if the zip cache survived.
 		if abs_path.get_extension().to_lower() == "vmz":
 			var cache_dir := ProjectSettings.globalize_path(TMP_DIR)
 			var cached := cache_dir.path_join(abs_path.get_file().get_basename() + ".zip")
 			if FileAccess.file_exists(cached):
+				log_lines.append("[FileScope]   STALE (vmz gone, cache ok): " + abs_path)
 				any_stale = true
 				continue
+		log_lines.append("[FileScope]   MISSING: " + abs_path)
 		any_missing = true
 
 	if any_missing:
+		log_lines.append("[FileScope] Archive(s) missing — resetting to clean state")
 		# Archive gone, no cache. Wipe override.cfg autoload sections so the next
 		# boot is clean, but preserve any non-autoload settings ([display], etc.).
 		var exe_dir := OS.get_executable_path().get_base_dir()
@@ -99,6 +135,7 @@ static func _mount_previous_session() -> int:
 		var state_path := ProjectSettings.globalize_path(PASS_STATE_PATH)
 		if FileAccess.file_exists(state_path):
 			DirAccess.remove_absolute(state_path)
+		_write_filescope_log(log_lines)
 		return 0
 
 	if any_stale:
@@ -109,12 +146,73 @@ static func _mount_previous_session() -> int:
 	var count := 0
 	for path in paths:
 		if ProjectSettings.load_resource_pack(path):
+			log_lines.append("[FileScope]   MOUNTED: " + path)
 			count += 1
 		elif path.get_extension().to_lower() == "vmz":
 			var zip_path := _static_vmz_to_zip(path)
 			if not zip_path.is_empty() and ProjectSettings.load_resource_pack(zip_path):
+				log_lines.append("[FileScope]   MOUNTED (vmz→zip): " + path)
 				count += 1
+			else:
+				log_lines.append("[FileScope]   MOUNT FAILED (vmz): " + path + " zip_path=" + zip_path)
+		else:
+			log_lines.append("[FileScope]   MOUNT FAILED: " + path)
+
+	# Also mount hook pack if present.
+	var hook_pack := ProjectSettings.globalize_path(HOOK_PACK_PATH)
+	if FileAccess.file_exists(hook_pack):
+		if ProjectSettings.load_resource_pack(hook_pack):
+			log_lines.append("[FileScope]   MOUNTED hook pack: " + hook_pack)
+		else:
+			log_lines.append("[FileScope]   HOOK PACK MOUNT FAILED: " + hook_pack)
+
+	log_lines.append("[FileScope] Done — %d archive(s) mounted" % count)
+	_write_filescope_log(log_lines)
 	return count
+
+## Write diagnostic log from static/file-scope context (can't use _log_info).
+static func _write_filescope_log(lines: PackedStringArray) -> void:
+	for line in lines:
+		print(line)
+	var f := FileAccess.open("user://modloader_filescope.log", FileAccess.WRITE)
+	if f:
+		for line in lines:
+			f.store_line(line)
+		f.close()
+
+# Called from _mount_previous_session() when a game update is detected (exe mtime
+# changed). Removes the hook pack ZIP and vanilla source cache so Pass 1 can
+# regenerate hooks from the updated game scripts.
+static func _static_wipe_hook_cache() -> void:
+	var pack_path := ProjectSettings.globalize_path(HOOK_PACK_PATH)
+	if FileAccess.file_exists(pack_path):
+		DirAccess.remove_absolute(pack_path)
+	var cache_dir := ProjectSettings.globalize_path(VANILLA_CACHE_DIR)
+	if not DirAccess.dir_exists_absolute(cache_dir):
+		return
+	var dir := DirAccess.open(cache_dir)
+	if dir == null:
+		return
+	dir.list_dir_begin()
+	var file_name := dir.get_next()
+	while file_name != "":
+		var full := cache_dir.path_join(file_name)
+		if dir.current_is_dir():
+			# Shallow — vanilla cache is only Scripts/*.gd (one level deep)
+			var sub := DirAccess.open(full)
+			if sub:
+				sub.list_dir_begin()
+				var sub_file := sub.get_next()
+				while sub_file != "":
+					DirAccess.remove_absolute(full.path_join(sub_file))
+					sub_file = sub.get_next()
+				sub.list_dir_end()
+			DirAccess.remove_absolute(full)
+		else:
+			DirAccess.remove_absolute(full)
+		file_name = dir.get_next()
+	dir.list_dir_end()
+	DirAccess.remove_absolute(cache_dir)
 
 static func _static_vmz_to_zip(vmz_path: String) -> String:
 	var cache_dir := ProjectSettings.globalize_path(TMP_DIR)
@@ -160,6 +258,7 @@ func _run_pass_1() -> void:
 	_check_crash_recovery()
 	_check_safe_mode()
 	_compile_regex()
+	_build_class_name_lookup()
 	_load_developer_mode_setting()
 	_ui_mod_entries = collect_mod_metadata()
 	_clean_stale_cache()
@@ -168,10 +267,14 @@ func _run_pass_1() -> void:
 	_save_ui_config()
 
 	load_all_mods()
+
 	var sections := _build_autoload_sections()
 	var archive_paths := _collect_enabled_archive_paths()
 
-	# Skip restart if mod state hasn't changed since last launch.
+	# Compute state hash BEFORE generating hook pack. The hash includes "h:" entries
+	# from _hook_registry (populated by load_all_mods), mod archive paths+mtimes, and
+	# autoload sections. The hook pack is a derived artifact — its content is fully
+	# determined by these inputs, so we don't need it to exist for the hash.
 	var new_hash := _compute_state_hash(archive_paths, sections.prepend)
 	var old_hash := ""
 	var state_cfg := ConfigFile.new()
@@ -182,6 +285,26 @@ func _run_pass_1() -> void:
 		_log_info("Mod state unchanged — skipping restart")
 		await _finish_with_existing_mounts()
 		return
+
+	# State changed — generate hook pack if any mod declared [hooks].
+	# Must run AFTER load_all_mods() so vanilla scripts are readable via load().
+	# Hook pack is appended LAST to archive_paths so it wins over everything.
+	var hook_pack_path := _generate_hook_pack()
+	if hook_pack_path != "":
+		if not ProjectSettings.load_resource_pack(hook_pack_path):
+			_log_critical("[Hooks] Failed to mount hook pack")
+			hook_pack_path = ""
+		else:
+			archive_paths.append(hook_pack_path)
+	elif not _hook_script_paths.is_empty():
+		_log_critical("[Hooks] Hook pack generation failed — hooks will not work")
+
+	# Clean up stale hook artifacts if no hooks are needed this session.
+	if _hook_script_paths.is_empty():
+		var pack_file := ProjectSettings.globalize_path(HOOK_PACK_PATH)
+		if FileAccess.file_exists(pack_file):
+			_static_wipe_hook_cache()
+			_log_info("[Hooks] Cleaned up unused hook artifacts")
 
 	if archive_paths.size() > 0:
 		_log_info("Preparing two-pass restart — %d archive(s)" % archive_paths.size())
@@ -249,6 +372,7 @@ func _run_pass_2() -> void:
 	_log_info("Pass 2 — %d archive(s) mounted at file-scope" % _file_scope_mounts)
 	_clear_restart_counter()
 	_compile_regex()
+	_build_class_name_lookup()
 	_load_developer_mode_setting()
 	_ui_mod_entries = collect_mod_metadata()
 	_load_ui_config()
@@ -1113,6 +1237,9 @@ func load_all_mods(pass_label: String = "") -> void:
 	_database_replaced_by = ""
 	_mod_script_analysis.clear()
 	_archive_file_sets.clear()
+	_hook_registry.clear()
+	_hook_script_paths.clear()
+	_hook_call_depth.clear()
 
 	DirAccess.make_dir_recursive_absolute(ProjectSettings.globalize_path(TMP_DIR))
 
@@ -1196,6 +1323,21 @@ func _process_mod_candidate(c: Dictionary, load_index: int) -> void:
 		return
 
 	_loaded_mod_ids[mod_id] = true
+
+	# Parse [hooks] before [autoload] — mods with hooks but no autoloads still work.
+	if cfg != null and cfg.has_section("hooks"):
+		for key in cfg.get_section_keys("hooks"):
+			var script_path := str(key)
+			var methods_str := str(cfg.get_value("hooks", key))
+			for method_name in methods_str.split(","):
+				method_name = method_name.strip_edges()
+				if method_name.is_empty():
+					continue
+				_hook_script_paths[script_path] = true
+				var hook_key := script_path + "::" + method_name
+				if not _hook_registry.has(hook_key):
+					_hook_registry[hook_key] = { "before": [], "after": [] }
+				_log_info("  Hook declared: %s :: %s [%s]" % [script_path, method_name, mod_name])
 
 	if cfg == null or not cfg.has_section("autoload"):
 		return
@@ -1286,6 +1428,444 @@ func _compare_load_order(a: Dictionary, b: Dictionary) -> bool:
 	# Filename tiebreaker for stable sort.
 	return (a["file_name"] as String).to_lower() < (b["file_name"] as String).to_lower()
 
+# Script hooks — lets multiple mods modify methods on vanilla class_name scripts.
+# Mods declare hooks in mod.txt [hooks]; the preprocessor rewrites vanilla methods
+# with dispatch wrappers. Mods register callables via add_hook() at runtime.
+
+## Register a hook callable for a vanilla method. Called by mod autoloads in _ready().
+## before=true: fires before the vanilla method (return true from callback to skip it).
+##   Before-hooks share the args array — modifications are visible to subsequent hooks.
+## before=false: fires after (callback receives (instance, args, result_wrapper)).
+##   result_wrapper is [return_value] for non-void methods, [] for void.
+## The method must be declared in mod.txt [hooks] for the imposter to exist.
+func add_hook(script_path: String, method_name: String, callback: Callable, before: bool = true) -> void:
+	var key := script_path + "::" + method_name
+	if not _hook_script_paths.has(script_path):
+		_log_warning("[Hooks] add_hook() for undeclared script %s — add [hooks] to mod.txt" % script_path)
+	if not _hook_registry.has(key):
+		_log_warning("[Hooks] add_hook() for undeclared method %s::%s — hook will not fire" % [script_path, method_name])
+		_hook_registry[key] = { "before": [], "after": [] }
+	var list_key := "before" if before else "after"
+	if callback in _hook_registry[key][list_key]:
+		return  # Already registered (guard against double _ready() from scene reloads)
+	_hook_registry[key][list_key].append(callback)
+
+# Called by generated imposter functions. Returns true if any hook wants to skip vanilla.
+func _call_before_hooks(script_path: String, method_name: String, instance: Object, args: Array) -> bool:
+	var key := script_path + "::" + method_name
+	if not _hook_registry.has(key):
+		return false
+	# Reentrancy guard: if a hook callback calls the same hooked method, skip hooks
+	# to prevent infinite recursion. The vanilla method runs directly instead.
+	var depth: int = _hook_call_depth.get(key, 0)
+	if depth > 0:
+		return false
+	_hook_call_depth[key] = depth + 1
+	var skip := false
+	for callable in _hook_registry[key]["before"]:
+		if not callable.is_valid():
+			continue
+		var result = callable.call(instance, args)
+		if result == true:
+			skip = true
+			break
+	_hook_call_depth[key] = depth
+	return skip
+
+# Called by generated imposter functions. result is [] for void, [value] otherwise.
+func _call_after_hooks(script_path: String, method_name: String, instance: Object, args: Array, result: Array) -> void:
+	var key := script_path + "::" + method_name
+	if not _hook_registry.has(key):
+		return
+	# Reentrancy guard shared with _call_before_hooks via _hook_call_depth.
+	var depth: int = _hook_call_depth.get(key, 0)
+	if depth > 0:
+		return
+	_hook_call_depth[key] = depth + 1
+	for callable in _hook_registry[key]["after"]:
+		if not callable.is_valid():
+			continue
+		callable.call(instance, args, result)
+	_hook_call_depth[key] = depth
+
+# Populates _class_name_to_path from the engine's global_script_class_cache.cfg.
+# Used for hook validation and take_over_path safety warnings.
+func _build_class_name_lookup() -> void:
+	_class_name_to_path.clear()
+	var cache := ConfigFile.new()
+	if cache.load("res://.godot/global_script_class_cache.cfg") == OK:
+		var class_list: Array = cache.get_value("", "list", [])
+		for entry in class_list:
+			var cn: String = str(entry.get("class", ""))
+			var path: String = str(entry.get("path", ""))
+			if cn != "" and path != "":
+				_class_name_to_path[cn] = path
+		_log_info("Loaded %d class_name mappings from game cache" % _class_name_to_path.size())
+	else:
+		_log_warning("Could not load global_script_class_cache.cfg — using hardcoded fallback")
+		_class_name_to_path = _get_hardcoded_class_map()
+
+# Fallback for when global_script_class_cache.cfg is unavailable.
+# 57 entries — extracted from RTV decompiled scripts.
+# Notable: Flash -> MuzzleFlash.gd, Knife -> KnifeRig.gd.
+func _get_hardcoded_class_map() -> Dictionary:
+	return {
+		"AIWeaponData": "res://Scripts/AIWeaponData.gd",
+		"Area": "res://Scripts/Area.gd",
+		"AttachmentData": "res://Scripts/AttachmentData.gd",
+		"AudioEvent": "res://Scripts/AudioEvent.gd",
+		"AudioLibrary": "res://Scripts/AudioLibrary.gd",
+		"Camera": "res://Scripts/Camera.gd",
+		"CasetteData": "res://Scripts/CasetteData.gd",
+		"CatData": "res://Scripts/CatData.gd",
+		"CharacterSave": "res://Scripts/CharacterSave.gd",
+		"ContainerSave": "res://Scripts/ContainerSave.gd",
+		"Controller": "res://Scripts/Controller.gd",
+		"Door": "res://Scripts/Door.gd",
+		"EventData": "res://Scripts/EventData.gd",
+		"Events": "res://Scripts/Events.gd",
+		"Fish": "res://Scripts/Fish.gd",
+		"FishingData": "res://Scripts/FishingData.gd",
+		"Flash": "res://Scripts/MuzzleFlash.gd",
+		"Furniture": "res://Scripts/Furniture.gd",
+		"FurnitureSave": "res://Scripts/FurnitureSave.gd",
+		"GameData": "res://Scripts/GameData.gd",
+		"Grenade": "res://Scripts/Grenade.gd",
+		"GrenadeData": "res://Scripts/GrenadeData.gd",
+		"Grid": "res://Scripts/Grid.gd",
+		"Hitbox": "res://Scripts/Hitbox.gd",
+		"Inspect": "res://Scripts/Inspect.gd",
+		"InstrumentData": "res://Scripts/InstrumentData.gd",
+		"Item": "res://Scripts/Item.gd",
+		"ItemData": "res://Scripts/ItemData.gd",
+		"ItemSave": "res://Scripts/ItemSave.gd",
+		"Knife": "res://Scripts/KnifeRig.gd",
+		"KnifeData": "res://Scripts/KnifeData.gd",
+		"LootContainer": "res://Scripts/LootContainer.gd",
+		"LootTable": "res://Scripts/LootTable.gd",
+		"Lure": "res://Scripts/Lure.gd",
+		"Mine": "res://Scripts/Mine.gd",
+		"Pickup": "res://Scripts/Pickup.gd",
+		"Preferences": "res://Scripts/Preferences.gd",
+		"RecipeData": "res://Scripts/RecipeData.gd",
+		"Recipes": "res://Scripts/Recipes.gd",
+		"Settings": "res://Scripts/Settings.gd",
+		"ShelterSave": "res://Scripts/ShelterSave.gd",
+		"Slot": "res://Scripts/Slot.gd",
+		"SlotData": "res://Scripts/SlotData.gd",
+		"SpawnerChunkData": "res://Scripts/SpawnerChunkData.gd",
+		"SpawnerData": "res://Scripts/SpawnerData.gd",
+		"SpawnerSceneData": "res://Scripts/SpawnerSceneData.gd",
+		"SpineData": "res://Scripts/SpineData.gd",
+		"Surface": "res://Scripts/Surface.gd",
+		"SwitchSave": "res://Scripts/SwitchSave.gd",
+		"TaskData": "res://Scripts/TaskData.gd",
+		"TrackData": "res://Scripts/TrackData.gd",
+		"Trader": "res://Scripts/Trader.gd",
+		"TraderData": "res://Scripts/TraderData.gd",
+		"TraderSave": "res://Scripts/TraderSave.gd",
+		"Validator": "res://Scripts/Validator.gd",
+		"WeaponData": "res://Scripts/WeaponData.gd",
+		"WeaponRig": "res://Scripts/WeaponRig.gd",
+		"WorldSave": "res://Scripts/WorldSave.gd",
+	}
+
+# Vanilla source cache — the previous session's hook pack may be file-scope-mounted,
+# making load().source_code return the hooked version. This cache stores the original
+# un-hooked source to prevent double-processing on subsequent launches.
+
+func _read_vanilla_source(script_path: String) -> String:
+	# The previous session's hook pack may already be mounted (via file-scope
+	# _mount_previous_session), so load() could return the HOOKED version.
+	# The vanilla cache stores the original, un-hooked source.
+	var cache_file := VANILLA_CACHE_DIR.path_join(script_path.trim_prefix("res://"))
+	if FileAccess.file_exists(cache_file):
+		var cached := FileAccess.get_file_as_string(cache_file)
+		if not cached.is_empty():
+			var live := load(script_path) as GDScript
+			if live and ("func _vanilla_" not in live.source_code):
+				# Live source is un-hooked (no hook pack, or pack doesn't cover
+				# this script). If it differs from cache, the game was updated.
+				if live.source_code != cached:
+					_save_vanilla_source(script_path, live.source_code)
+					return live.source_code
+				return cached
+			# Live source IS hooked (previous hook pack mounted). Trust cache.
+			return cached
+
+	# No cache — first time hooking this script.
+	var script := load(script_path) as GDScript
+	if script == null or script.source_code.is_empty():
+		return ""
+	var source := script.source_code
+	if "func _vanilla_" in source:
+		# Hook pack is mounted but no cache exists (manual deletion?).
+		_log_critical("[Hooks] Cannot read vanilla source for %s — delete %s and restart"
+				% [script_path, ProjectSettings.globalize_path(HOOK_PACK_PATH)])
+		return ""
+	_save_vanilla_source(script_path, source)
+	return source
+
+func _save_vanilla_source(script_path: String, source: String) -> void:
+	var cache_file := VANILLA_CACHE_DIR.path_join(script_path.trim_prefix("res://"))
+	DirAccess.make_dir_recursive_absolute(
+		ProjectSettings.globalize_path(cache_file.get_base_dir()))
+	var f := FileAccess.open(cache_file, FileAccess.WRITE)
+	if f:
+		f.store_string(source)
+		f.close()
+
+# Script preprocessor — renames vanilla methods to _vanilla_<name> and appends
+# imposter wrappers that dispatch to registered hooks. Uses reflection for method
+# metadata (params, types, flags) and source text for body boundaries.
+
+func _preprocess_script(script_path: String, hooked_methods: Array[String]) -> String:
+	var source := _read_vanilla_source(script_path)
+	if source.is_empty():
+		_log_critical("[Hooks] Failed to read vanilla source for: " + script_path)
+		return ""
+	var lines := source.split("\n")
+
+	var script := load(script_path) as GDScript
+	if script == null:
+		_log_critical("[Hooks] Failed to load script: " + script_path)
+		return ""
+
+	var base_methods := {}
+	var base := script.get_base_script()
+	if base:
+		for m in base.get_script_method_list():
+			base_methods[m["name"]] = true
+
+	var own_methods: Array[Dictionary] = []
+	for m in script.get_script_method_list():
+		if base_methods.has(m["name"]):
+			continue
+		if (m["name"] as String).begins_with("_vanilla_"):
+			continue
+		own_methods.append(m)
+
+	var method_info := {}
+	for m in own_methods:
+		if m["name"] in hooked_methods:
+			var info := _extract_method_info(script, lines, m)
+			if info != null:
+				method_info[m["name"]] = info
+			else:
+				_log_warning("[Hooks] Could not extract method info for: %s::%s" % [script_path, m["name"]])
+
+	# Warn about declared methods that weren't found (likely typos in mod.txt).
+	for hm in hooked_methods:
+		if hm not in method_info:
+			_log_warning("[Hooks] Method '%s' not found in %s — check mod.txt [hooks]" % [hm, script_path])
+
+	if method_info.is_empty():
+		_log_warning("[Hooks] No hookable methods found in: " + script_path)
+		return ""
+
+	# Process methods from bottom to top so renaming doesn't shift line numbers.
+	var sorted_methods := method_info.keys()
+	sorted_methods.sort_custom(func(a, b): return method_info[a]["line"] > method_info[b]["line"])
+
+	var imposters := []
+	for method_name in sorted_methods:
+		var info = method_info[method_name]
+		lines[info["line"]] = lines[info["line"]].replace(
+			"func " + method_name + "(", "func _vanilla_" + method_name + "(")
+		# Rewrite bare super() calls in the renamed method's body.
+		# super() in a method named _vanilla_Foo would try to call the parent's
+		# _vanilla_Foo (which doesn't exist). Rewrite to super.Foo().
+		for i in range(info["body_start"], info["body_end"]):
+			lines[i] = (lines[i] as String).replace("super(", "super." + method_name + "(")
+		imposters.append(_generate_imposter(script_path, method_name, info))
+
+	var result := "\n".join(lines)
+	for imp in imposters:
+		result += "\n\n" + imp
+	return result
+
+# Extracts line boundaries, parameter names, and flags for a single method.
+# Uses reflection (get_script_method_list data) for params/types/flags, and
+# source scanning for line boundaries (get_member_line returns -1 in exports).
+# Returns null if the method is unhookable (inner class, getter/setter, etc.).
+func _extract_method_info(script: GDScript, lines: Array, method_dict: Dictionary) -> Variant:
+	var method_name: String = method_dict["name"]
+
+	# get_member_line() is gated behind TOOLS_ENABLED — returns -1 in export builds.
+	var start_line: int = script.get_member_line(method_name) - 1
+	if start_line < 0:
+		for i in lines.size():
+			var stripped: String = lines[i].strip_edges()
+			if stripped.begins_with("func " + method_name + "(") \
+					or stripped.begins_with("static func " + method_name + "("):
+				start_line = i
+				break
+		if start_line < 0:
+			return null
+
+	var sig_line: String = lines[start_line]
+
+	# Skip inner-class methods (indented func declarations).
+	if sig_line.begins_with("\t") or sig_line.begins_with(" "):
+		return null
+
+	# Skip property getters/setters (declared as "var x: Type: set = Foo").
+	var full_source := "\n".join(lines)
+	if ("set = " + method_name) in full_source or ("get = " + method_name) in full_source:
+		return null
+
+	# Find body end by scanning for the next line at same or lower indent level.
+	var body_start: int = start_line + 1
+	var body_end := lines.size()
+	var base_indent := _get_indent_level(sig_line)
+	for i in range(body_start, lines.size()):
+		var stripped: String = lines[i].strip_edges()
+		if stripped.is_empty() or stripped.begins_with("#"):
+			continue
+		if _get_indent_level(lines[i]) <= base_indent:
+			body_end = i
+			break
+
+	# Parameter names from reflection (reliable in export builds).
+	var param_names: Array[String] = []
+	for arg in method_dict["args"]:
+		param_names.append(arg["name"])
+
+	# Detect async by scanning for "await " in the method body.
+	var body_text := ""
+	for i in range(body_start, body_end):
+		body_text += lines[i] + "\n"
+	var is_async := "await " in body_text
+
+	# Return type: "void" (explicit annotation or _init), "typed" (non-Nil), "" (untyped).
+	var return_type := ""
+	var ret = method_dict["return"]
+	if method_name == "_init":
+		return_type = "void"
+	elif ret["type"] == 0:  # Variant::NIL — could be void or untyped
+		if "-> void" in sig_line:
+			return_type = "void"
+	else:
+		return_type = "typed"
+
+	var is_static: bool = (int(method_dict["flags"]) & 32) != 0  # METHOD_FLAG_STATIC
+
+	return {
+		"line": start_line,
+		"signature_line": sig_line,
+		"body_start": body_start,
+		"body_end": body_end,
+		"param_names": param_names,
+		"is_static": is_static,
+		"is_async": is_async,
+		"return_type": return_type,
+	}
+
+func _get_indent_level(line: String) -> int:
+	var count := 0
+	for c in line:
+		if c == '\t':
+			count += 1
+		else:
+			break
+	return count
+
+# Generates the wrapper function that replaces the original method name.
+# Dispatches to before-hooks, calls _vanilla_<method>, then after-hooks.
+# Preserves the original signature verbatim (default values, type annotations).
+func _generate_imposter(script_path: String, method_name: String, info: Dictionary) -> String:
+	var lines := PackedStringArray()
+	lines.append(info["signature_line"])
+
+	# Pack arguments into an array so before-hooks can modify them.
+	var args_str := "[" + ", ".join(info["param_names"]) + "]"
+	lines.append("\tvar __hook_args := " + args_str)
+
+	# Before-hooks: return true to skip the vanilla method entirely.
+	var self_ref := "null" if info["is_static"] else "self"
+	lines.append('\tvar __skip := ModLoader._call_before_hooks("%s", "%s", %s, __hook_args)' \
+			% [script_path, method_name, self_ref])
+
+	if info["return_type"] == "void":
+		lines.append("\tif __skip: return")
+	else:
+		lines.append("\tif __skip: return __hook_args[0] if __hook_args.size() > 0 else null")
+
+	# Unpack potentially-modified args back into local variables.
+	for i in info["param_names"].size():
+		lines.append("\t%s = __hook_args[%d]" % [info["param_names"][i], i])
+
+	# Call the renamed vanilla method.
+	var call_args := ", ".join(info["param_names"])
+	var vanilla_call := "_vanilla_" + method_name + "(" + call_args + ")"
+	if info["is_async"]:
+		vanilla_call = "await " + vanilla_call
+
+	# After-hooks: receive (instance, args, result_wrapper).
+	# result_wrapper is a single-element array so after-hooks can modify the return.
+	if info["return_type"] == "void":
+		lines.append("\t" + vanilla_call)
+		lines.append('\tModLoader._call_after_hooks("%s", "%s", %s, __hook_args, [])' \
+				% [script_path, method_name, self_ref])
+	else:
+		lines.append("\tvar __result = " + vanilla_call)
+		lines.append("\tvar __result_wrapper := [__result]")
+		lines.append('\tModLoader._call_after_hooks("%s", "%s", %s, __hook_args, __result_wrapper)' \
+				% [script_path, method_name, self_ref])
+		lines.append("\treturn __result_wrapper[0]")
+
+	return "\n".join(lines)
+
+# Hook pack generation — writes transformed scripts to a ZIP mounted via load_resource_pack
+
+func _generate_hook_pack() -> String:
+	if _hook_script_paths.is_empty():
+		return ""
+
+	DirAccess.make_dir_recursive_absolute(ProjectSettings.globalize_path(HOOK_PACK_DIR))
+
+	var pack_path := ProjectSettings.globalize_path(HOOK_PACK_PATH)
+	var zp := ZIPPacker.new()
+	if zp.open(pack_path) != OK:
+		_log_critical("[Hooks] Failed to create hook pack ZIP")
+		return ""
+
+	var any_success := false
+	for script_path: String in _hook_script_paths:
+		# Warn if a mod also ships a direct replacement for this script.
+		if _override_registry.has(script_path):
+			var claims: Array = _override_registry[script_path]
+			for claim in claims:
+				_log_warning("[Hooks] %s is hooked but also replaced by '%s' — hooks will wrap the modded version, not vanilla"
+						% [script_path, claim["mod_name"]])
+
+		var hooked_methods: Array[String] = []
+		for key: String in _hook_registry:
+			if key.begins_with(script_path + "::"):
+				hooked_methods.append(key.split("::")[1])
+		if hooked_methods.is_empty():
+			continue
+
+		var transformed := _preprocess_script(script_path, hooked_methods)
+		if transformed.is_empty():
+			_log_critical("[Hooks] Failed to preprocess: " + script_path)
+			continue
+
+		var zip_internal_path := script_path.replace("res://", "")
+		zp.start_file(zip_internal_path)
+		zp.write_file(transformed.to_utf8_buffer())
+		zp.close_file()
+		any_success = true
+		_log_info("[Hooks] Hooked: %s (%d methods)" % [script_path, hooked_methods.size()])
+
+	zp.close()
+
+	if not any_success:
+		DirAccess.remove_absolute(pack_path)
+		return ""
+
+	return pack_path
+
 # Archive scanner
 
 func scan_and_register_archive_claims(archive_path: String, mod_name: String,
@@ -1329,10 +1909,13 @@ func scan_and_register_archive_claims(archive_path: String, mod_name: String,
 	for f in files:
 		if f.get_extension().to_lower() == "gd":
 			gd_analysis["total_gd_files"] = gd_analysis["total_gd_files"] + 1
-			if _developer_mode:
-				var gd_bytes := zr.read_file(f)
-				if gd_bytes.size() > 0:
-					_scan_gd_source(gd_bytes.get_string_from_utf8(), gd_analysis)
+			var gd_bytes := zr.read_file(f)
+			if gd_bytes.size() > 0:
+				var gd_text := gd_bytes.get_string_from_utf8()
+				if _developer_mode:
+					_scan_gd_source(gd_text, gd_analysis)
+				if _class_name_to_path.size() > 0:
+					_check_class_name_safety(gd_text, f, mod_name)
 
 		var res_path := _normalize_to_res_path(f)
 		if res_path == "":
@@ -1453,6 +2036,23 @@ func _scan_gd_source(text: String, analysis: Dictionary) -> void:
 			if func_name not in (analysis["lifecycle_no_super"] as Array):
 				(analysis["lifecycle_no_super"] as Array).append(func_name)
 
+# Warn about class_name conflicts and take_over_path on class_name scripts.
+# Runs on every .gd file in every mod archive (not gated by developer mode).
+func _check_class_name_safety(text: String, file_path: String, mod_name: String) -> void:
+	for m_cn in _re_class_name.search_all(text):
+		var cn := m_cn.get_string(1)
+		if _class_name_to_path.has(cn):
+			var res_path := _normalize_to_res_path(file_path)
+			var game_path: String = _class_name_to_path[cn]
+			if res_path != game_path:
+				_log_critical("  CONFLICT: %s re-declares class_name %s (game has it at %s)" % [file_path, cn, game_path])
+	for m_to in _re_take_over.search_all(text):
+		var to_path := m_to.get_string(1)
+		for cn: String in _class_name_to_path:
+			if _class_name_to_path[cn] == to_path:
+				_log_critical("  DANGER: %s calls take_over_path on class_name script %s (%s) — this will crash" % [file_path, to_path, cn])
+				break
+
 # Override diagnostics (developer mode)
 
 # Log which mods use overrideScript() — overrides apply after scene reload.
@@ -1508,14 +2108,85 @@ func _collect_live_scripts(root_node: Node, out: Dictionary) -> void:
 # Two-pass helpers
 
 func _build_autoload_sections() -> Dictionary:
+	# Wipe previous early-autoload extractions so stale scripts don't linger.
+	_clean_early_autoload_dir()
 	var prepend: Array[Dictionary] = []
 	var append: Array[Dictionary] = []
 	for entry in _pending_autoloads:
 		if entry.get("is_early", false):
-			prepend.append({ "name": entry["name"], "path": entry["path"] })
+			var path: String = entry["path"]
+			# Godot may open all [autoload_prepend] scripts before any file-scope
+			# code runs, so scripts inside mod archives won't be found yet.  If the
+			# script only exists in a mounted archive (not on disk / game PCK),
+			# extract it to disk so Godot can open it at startup.
+			var disk_path := _ensure_early_autoload_on_disk(path, entry.get("mod_name", ""))
+			prepend.append({ "name": entry["name"], "path": disk_path })
 		else:
 			append.append({ "name": entry["name"], "path": entry["path"] })
 	return { "prepend": prepend, "append": append }
+
+const EARLY_AUTOLOAD_DIR := "user://modloader_early"
+
+func _clean_early_autoload_dir() -> void:
+	var dir_path := ProjectSettings.globalize_path(EARLY_AUTOLOAD_DIR)
+	if not DirAccess.dir_exists_absolute(dir_path):
+		return
+	var dir := DirAccess.open(dir_path)
+	if dir == null:
+		return
+	# Simple recursive wipe — this directory is entirely modloader-managed.
+	dir.list_dir_begin()
+	while true:
+		var entry := dir.get_next()
+		if entry == "":
+			break
+		var full := dir_path.path_join(entry)
+		if dir.current_is_dir():
+			var sub := DirAccess.open(full)
+			if sub:
+				sub.list_dir_begin()
+				var sub_file := sub.get_next()
+				while sub_file != "":
+					DirAccess.remove_absolute(full.path_join(sub_file))
+					sub_file = sub.get_next()
+				sub.list_dir_end()
+			DirAccess.remove_absolute(full)
+		else:
+			DirAccess.remove_absolute(full)
+	dir.list_dir_end()
+
+## If an early autoload script lives only inside a mod archive, extract it to
+## disk so Godot can open it before ModLoader's file-scope archive mounting
+## runs.  Scripts already on disk (or in the game PCK) are returned as-is.
+func _ensure_early_autoload_on_disk(res_path: String, mod_name: String) -> String:
+	# Already on disk?  Great — use it directly.
+	var global := ProjectSettings.globalize_path(res_path)
+	if FileAccess.file_exists(global):
+		return res_path
+
+	# Try loading via ResourceLoader (works for mounted archives + game PCK).
+	var script := load(res_path) as GDScript
+	if script == null or not script.has_source_code():
+		_log_warning("Early autoload '%s' not found — cannot extract to disk [%s]"
+				% [res_path, mod_name])
+		return res_path  # let it fail visibly on restart
+
+	# Extract to disk.
+	var rel := res_path.trim_prefix("res://")
+	var disk_dir := ProjectSettings.globalize_path(EARLY_AUTOLOAD_DIR)
+	var target := disk_dir.path_join(rel)
+	DirAccess.make_dir_recursive_absolute(target.get_base_dir())
+	var f := FileAccess.open(target, FileAccess.WRITE)
+	if f == null:
+		_log_critical("Cannot write early autoload to disk: " + target + " [" + mod_name + "]")
+		return res_path
+	f.store_string(script.source_code)
+	f.close()
+
+	# Return as user:// path so Godot finds it without archive mounting.
+	var user_path := EARLY_AUTOLOAD_DIR.path_join(rel)
+	_log_info("  Extracted early autoload to disk: " + user_path + " [" + mod_name + "]")
+	return user_path
 
 func _collect_enabled_archive_paths() -> PackedStringArray:
 	var paths := PackedStringArray()
@@ -1527,6 +2198,18 @@ func _collect_enabled_archive_paths() -> PackedStringArray:
 	candidates.sort_custom(_compare_load_order)
 	for c in candidates:
 		if c["ext"] == "zip":
+			continue
+		if c["ext"] == "folder":
+			# Folder mods are zipped to a temp cache during load_all_mods().
+			# Store the temp zip path — the folder itself can't be mounted.
+			var folder_name: String = c["full_path"].get_file()
+			var tmp_zip := ProjectSettings.globalize_path(TMP_DIR).path_join(
+					folder_name + "_dev.zip")
+			if FileAccess.file_exists(tmp_zip):
+				paths.append(tmp_zip)
+			else:
+				_log_warning("Folder mod '%s' has no cached zip — skipping from pass state"
+						% c["mod_name"])
 			continue
 		paths.append(c["full_path"])
 	return paths
@@ -1601,6 +2284,7 @@ func _write_pass_state(archive_paths: PackedStringArray, state_hash: String = ""
 	cfg.set_value("state", "mods_hash", state_hash)
 	cfg.set_value("state", "archive_paths", archive_paths)
 	cfg.set_value("state", "modloader_version", MODLOADER_VERSION)
+	cfg.set_value("state", "exe_mtime", FileAccess.get_modified_time(OS.get_executable_path()))
 	cfg.set_value("state", "timestamp", Time.get_unix_time_from_system())
 	var err := cfg.save(PASS_STATE_PATH)
 	if err != OK:
@@ -1623,6 +2307,10 @@ func _compute_state_hash(archive_paths: PackedStringArray, prepend_autoloads: Ar
 			var ver: String = (entry["cfg"] as ConfigFile).get_value("mod", "version", "")
 			if not ver.is_empty():
 				parts.append("v:%s=%s" % [entry["mod_id"], ver])
+	var sorted_hooks := _hook_registry.keys()
+	sorted_hooks.sort()
+	for key in sorted_hooks:
+		parts.append("h:" + key)
 	return "\n".join(parts).md5_text()
 
 func _write_heartbeat() -> void:
@@ -1663,7 +2351,7 @@ func _check_safe_mode() -> void:
 	DirAccess.remove_absolute(safe_path)
 
 func _clean_stale_cache() -> void:
-	# Remove cached zips whose source .vmz no longer exists in the mods folder.
+	# Remove cached zips whose source .vmz / folder no longer exists in the mods dir.
 	var cache_dir := ProjectSettings.globalize_path(TMP_DIR)
 	if not DirAccess.dir_exists_absolute(cache_dir):
 		return
@@ -1677,10 +2365,19 @@ func _clean_stale_cache() -> void:
 			break
 		if fname.get_extension().to_lower() != "zip":
 			continue
-		var vmz_name := fname.get_basename() + ".vmz"
-		if not FileAccess.file_exists(_mods_dir.path_join(vmz_name)):
-			DirAccess.remove_absolute(cache_dir.path_join(fname))
-			_log_debug("Removed stale cache: " + fname)
+		var base := fname.get_basename()
+		if base.ends_with("_dev"):
+			# Folder mod cache — check if the source folder still exists.
+			var folder_name := base.substr(0, base.length() - 4)
+			if DirAccess.dir_exists_absolute(_mods_dir.path_join(folder_name)):
+				continue
+		else:
+			# VMZ cache — check if the source .vmz still exists.
+			var vmz_name := base + ".vmz"
+			if FileAccess.file_exists(_mods_dir.path_join(vmz_name)):
+				continue
+		DirAccess.remove_absolute(cache_dir.path_join(fname))
+		_log_debug("Removed stale cache: " + fname)
 	dir.list_dir_end()
 
 func _restore_clean_override_cfg() -> void:
@@ -1730,6 +2427,16 @@ func _print_conflict_summary() -> void:
 				var marker := " <-- wins" if claim == winner else ""
 				_log_info("    [" + str(claim["load_index"] + 1) + "] "
 						+ claim["mod_name"] + " via " + claim["archive"] + marker)
+
+	if not _hook_script_paths.is_empty():
+		_log_info("")
+		_log_info("--- Hooked Scripts ---")
+		for script_path: String in _hook_script_paths:
+			var methods: Array[String] = []
+			for key: String in _hook_registry:
+				if key.begins_with(script_path + "::"):
+					methods.append(key.split("::")[1])
+			_log_info("  %s: %s" % [script_path, ", ".join(methods)])
 
 	_log_info("============================================")
 	_log_info("")
