@@ -2112,6 +2112,16 @@ func compare_versions(a: String, b: String) -> int:
 		if va > vb: return 1
 	return 0
 
+func _is_trusted_download_url(url: String) -> bool:
+	var lower := url.to_lower()
+	for domain in ["modworkshop.net", "github.com", "gitlab.com", "raw.githubusercontent.com"]:
+		if ("://" + domain + "/") in lower or ("://" + domain + ":") in lower:
+			return true
+	# Also allow storage.modworkshop.net subdomains
+	if "://storage.modworkshop.net/" in lower:
+		return true
+	return false
+
 func download_and_replace_mod(target_path: String, modworkshop_id: int) -> bool:
 	_log_info("[Download] Starting: mod " + str(modworkshop_id) + " -> " + target_path)
 
@@ -2153,6 +2163,9 @@ func download_and_replace_mod(target_path: String, modworkshop_id: int) -> bool:
 					var links_data: Array = links_parsed["data"]
 					for link in links_data:
 						var url_str := str(link.get("url", ""))
+						if not _is_trusted_download_url(url_str):
+							_log_warning("[Download] Skipping untrusted link: " + url_str)
+							continue
 						if url_str.ends_with(".vmz") or url_str.ends_with(".zip"):
 							download_url = url_str
 							_log_info("[Download] Got link URL: " + download_url)

@@ -40,23 +40,16 @@ if not exist "%GAME_PATH%\RTV.exe" (
 echo Found game at: %GAME_PATH%
 
 :: --- Set up paths ---
-set "USER_DATA=%APPDATA%\Road to Vostok"
-set "MODLOADER_DEST=%USER_DATA%\modloader.gd"
+set "MODLOADER_DEST=%GAME_PATH%\modloader.gd"
 set "OVERRIDE_PATH=%GAME_PATH%\override.cfg"
 set "MODS_PATH=%GAME_PATH%\mods"
 set "MODLOADER_URL=https://raw.githubusercontent.com/ametrocavich/vostok-mod-loader/master/modloader.gd"
-
-:: --- Create user data directory ---
-if not exist "%USER_DATA%" (
-    mkdir "%USER_DATA%"
-    echo Created user data directory
-)
 
 :: --- Download modloader.gd ---
 echo Downloading mod loader...
 powershell -Command "Invoke-WebRequest -Uri '%MODLOADER_URL%' -OutFile '%MODLOADER_DEST%' -UseBasicParsing" 2>nul
 if exist "%MODLOADER_DEST%" (
-    echo Downloaded modloader.gd
+    echo Downloaded modloader.gd to game folder
 ) else (
     echo WARNING: Failed to download modloader.gd
     echo You can manually download it from:
@@ -74,12 +67,12 @@ if exist "%OVERRIDE_PATH%" (
         echo Backing up existing override.cfg
         copy "%OVERRIDE_PATH%" "%OVERRIDE_PATH%.bak" >nul
         echo [autoload]> "%OVERRIDE_PATH%"
-        echo ModLoader="user://modloader.gd">> "%OVERRIDE_PATH%"
+        echo ModLoader="*res://modloader.gd">> "%OVERRIDE_PATH%"
         echo Created override.cfg
     )
 ) else (
     echo [autoload]> "%OVERRIDE_PATH%"
-    echo ModLoader="user://modloader.gd">> "%OVERRIDE_PATH%"
+    echo ModLoader="*res://modloader.gd">> "%OVERRIDE_PATH%"
     echo Created override.cfg
 )
 
@@ -104,7 +97,6 @@ echo   - Or place .vmz/.zip files in: %MODS_PATH%
 echo.
 echo Game path:  %GAME_PATH%
 echo Mods path:  %MODS_PATH%
-echo User data:  %USER_DATA%
 echo.
 goto :done
 
