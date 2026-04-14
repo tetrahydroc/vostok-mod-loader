@@ -1950,6 +1950,11 @@ func scan_and_register_archive_claims(archive_path: String, mod_name: String,
 					_check_class_name_safety(gd_text, f, mod_name)
 
 		var res_path := _normalize_to_res_path(f)
+		if res_path == "" and f.ends_with(".remap"):
+			# Exported mods compile .tscn/.tres to .scn/.res and leave .remap
+			# redirects.  Register the original path so autoload validation
+			# and conflict detection recognize it.
+			res_path = _normalize_to_res_path(f.trim_suffix(".remap"))
 		if res_path == "":
 			continue
 
