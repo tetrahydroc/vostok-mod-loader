@@ -1675,8 +1675,20 @@ func _preprocess_script(script_path: String, hooked_methods: Array[String]) -> S
 		# Rewrite bare super() calls in the renamed method's body.
 		# super() in a method named _vanilla_Foo would try to call the parent's
 		# _vanilla_Foo (which doesn't exist). Rewrite to super.Foo().
+		# Skip comment lines and avoid corrupting string literals.
 		for i in range(info["body_start"], info["body_end"]):
-			lines[i] = (lines[i] as String).replace("super(", "super." + method_name + "(")
+			var line_str: String = lines[i]
+			var stripped_line := line_str.strip_edges()
+			if stripped_line.begins_with("#"):
+				continue  # skip comment lines
+			if "super(" not in line_str:
+				continue  # fast path — no super() call on this line
+			# Only replace super( that appears before any # comment on the line.
+			var comment_pos := line_str.find("#")
+			var super_pos := line_str.find("super(")
+			if comment_pos >= 0 and super_pos > comment_pos:
+				continue  # super( is inside a comment
+			lines[i] = line_str.replace("super(", "super." + method_name + "(")
 		imposters.append(_generate_imposter(script_path, method_name, info))
 
 	var result := "\n".join(lines)
@@ -1693,7 +1705,12 @@ func _extract_method_info(script: GDScript, lines: Array, method_dict: Dictionar
 
 	# get_member_line() is gated behind TOOLS_ENABLED — returns -1 in export builds.
 	var start_line: int = script.get_member_line(method_name) - 1
-	if start_line < 0:
+	if start_line < 0 or start_line >= lines.size():
+		# get_member_line() returns -1 in export builds, or may return a line
+		# from a hooked source when the hook pack is file-scope-mounted (the
+		# imposter appended at the bottom would be past vanilla line count).
+		# Fall back to scanning the vanilla source text.
+		start_line = -1
 		for i in lines.size():
 			var stripped: String = lines[i].strip_edges()
 			if stripped.begins_with("func " + method_name + "(") \
@@ -1710,9 +1727,14 @@ func _extract_method_info(script: GDScript, lines: Array, method_dict: Dictionar
 		return null
 
 	# Skip property getters/setters (declared as "var x: Type: set = Foo").
-	var full_source := "\n".join(lines)
-	if ("set = " + method_name) in full_source or ("get = " + method_name) in full_source:
-		return null
+	# Only check lines starting with "var " or "@export" to avoid false positives
+	# from comments or partial name matches.
+	for check_line: String in lines:
+		var stripped_check := check_line.strip_edges()
+		if not stripped_check.begins_with("var ") and not stripped_check.begins_with("@export"):
+			continue
+		if (": set = " + method_name) in check_line or (": get = " + method_name) in check_line:
+			return null
 
 	# Find body end by scanning for the next line at same or lower indent level.
 	var body_start: int = start_line + 1
@@ -1737,10 +1759,10 @@ func _extract_method_info(script: GDScript, lines: Array, method_dict: Dictionar
 		body_text += lines[i] + "\n"
 	var is_async := "await " in body_text
 
-	# Return type: "void" (explicit annotation or _init), "typed" (non-Nil), "" (untyped).
+	# Return type: "void" (explicit annotation, lifecycle, or _init), "typed" (non-Nil), "" (untyped).
 	var return_type := ""
 	var ret = method_dict["return"]
-	if method_name == "_init":
+	if method_name == "_init" or method_name in LIFECYCLE_METHODS:
 		return_type = "void"
 	elif ret["type"] == 0:  # Variant::NIL — could be void or untyped
 		if "-> void" in sig_line:
@@ -1788,8 +1810,14 @@ func _generate_imposter(script_path: String, method_name: String, info: Dictiona
 
 	if info["return_type"] == "void":
 		lines.append("\tif __skip: return")
+	elif info["return_type"] == "":
+		# Untyped return — null is safe.
+		lines.append("\tif __skip: return")
 	else:
-		lines.append("\tif __skip: return __hook_args[0] if __hook_args.size() > 0 else null")
+		# Typed return — a before-hook that skips must accept a potentially
+		# wrong default.  The hook should set a proper return via the args/result
+		# mechanism if it cares about the return value.
+		lines.append("\tif __skip: return")
 
 	# Unpack potentially-modified args back into local variables.
 	for i in info["param_names"].size():
