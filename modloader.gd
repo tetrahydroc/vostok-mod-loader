@@ -4,7 +4,28 @@
 ## prepend mod autoloads before the game's own autoloads via [autoload_prepend].
 extends Node
 
+# release-please bumps MODLOADER_VERSION automatically via Conventional Commits:
+#   feat: ... -> minor bump
+#   fix: ...  -> patch bump
+#   feat!: or BREAKING CHANGE: -> major bump
+# The major/minor/patch accessors parse this single source of truth so mods can
+# compare against it without hand-maintaining a second set of constants.
+# x-release-please-start-version
 const MODLOADER_VERSION := "2.3.0"
+# x-release-please-end
+
+static func version() -> String:
+	return MODLOADER_VERSION
+
+static func major_version() -> int:
+	return int(MODLOADER_VERSION.split(".")[0])
+
+static func minor_version() -> int:
+	return int(MODLOADER_VERSION.split(".")[1])
+
+static func patch_version() -> int:
+	return int(MODLOADER_VERSION.split(".")[2])
+
 const MODLOADER_RES_PATH := "res://modloader.gd"
 const MOD_DIR := "mods"
 const TMP_DIR := "user://vmz_mount_cache"
@@ -143,8 +164,9 @@ static func _mount_previous_session() -> int:
 	# entries for mods that are no longer enabled, causing Godot to fail loading
 	# their scripts before modloader's _ready even runs.
 	var saved_ver: String = cfg.get_value("state", "modloader_version", "")
-	if saved_ver != MODLOADER_VERSION:
-		log_lines.append("[FileScope] Version mismatch: saved=%s current=%s -- wiping" % [saved_ver, MODLOADER_VERSION])
+	var current_ver := version()
+	if saved_ver != current_ver:
+		log_lines.append("[FileScope] Version mismatch: saved=%s current=%s -- wiping" % [saved_ver, current_ver])
 		DirAccess.remove_absolute(ProjectSettings.globalize_path(PASS_STATE_PATH))
 		_static_reset_override_cfg(log_lines)
 		_write_filescope_log(log_lines)
@@ -348,7 +370,7 @@ func _ready() -> void:
 # Pass 1: Normal launch -- show UI, configure, optionally restart
 
 func _run_pass_1() -> void:
-	_log_info("Metro Mod Loader v" + MODLOADER_VERSION)
+	_log_info("Metro Mod Loader v" + version())
 	_check_crash_recovery()
 	_check_safe_mode()
 	_compile_regex()
@@ -1755,6 +1777,17 @@ func _connect_node_swap() -> void:
 	get_tree().node_added.connect(_on_node_added)
 	_node_swap_connected = true
 	_log_info("[RTVModLib] node_added connected -- tracking %d script(s)" % _hook_swap_map.size())
+
+	# Engine-level autoload scenes (Loader, Database, Simulation) were added to
+	# the tree before node_added was connected, so node_added never fires for
+	# them. Scan existing tree nodes once to catch anything matching a wrapped
+	# vanilla script. This is the fix for the autoload blind spot.
+	_scan_existing_for_swap(get_tree().root)
+
+func _scan_existing_for_swap(node: Node) -> void:
+	_on_node_added(node)
+	for child in node.get_children():
+		_scan_existing_for_swap(child)
 
 func _on_node_added(node: Node) -> void:
 	var node_script = node.get_script()
@@ -3296,7 +3329,7 @@ func _write_pass_state(archive_paths: PackedStringArray, state_hash: String = ""
 	cfg.set_value("state", "restart_count", count + 1)
 	cfg.set_value("state", "mods_hash", state_hash)
 	cfg.set_value("state", "archive_paths", archive_paths)
-	cfg.set_value("state", "modloader_version", MODLOADER_VERSION)
+	cfg.set_value("state", "modloader_version", version())
 	cfg.set_value("state", "exe_mtime", FileAccess.get_modified_time(OS.get_executable_path()))
 	cfg.set_value("state", "timestamp", Time.get_unix_time_from_system())
 	# Persist script overrides so Pass 2 can apply them without re-parsing mods.
@@ -3327,7 +3360,7 @@ func _compute_state_hash(archive_paths: PackedStringArray, prepend_autoloads: Ar
 				parts.append("v:%s=%s" % [entry["mod_id"], ver])
 	for entry in _pending_script_overrides:
 		parts.append("so:%s=%s" % [entry["vanilla_path"], entry["mod_script_path"]])
-	parts.append("ml:" + MODLOADER_VERSION)
+	parts.append("ml:" + version())
 	return "\n".join(parts).md5_text()
 
 func _write_heartbeat() -> void:
