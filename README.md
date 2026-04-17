@@ -362,6 +362,13 @@ With Developer Mode enabled, a full conflict log is written to `%APPDATA%\Road t
 
 This repo uses **Conventional Commits** to drive automatic version bumps and changelog generation via [release-please](https://github.com/googleapis/release-please). When a PR merges to `master`, release-please opens a follow-up PR that bumps the version in `modloader.gd` and updates `CHANGELOG.md`. Merging that PR creates the git tag and GitHub Release.
 
+### Branches
+
+- **`development`**: target for all contributor PRs. Feature branches merge here via squash (keeps each PR as a single clean conventional commit).
+- **`master`** : release branch. Only maintainer PRs from `development → master` land here, via rebase-merge so every individual commit is preserved for release-please to read.
+
+In other words: if you're contributing, open your PR against `development`. Maintainers batch accumulated work into a PR to `master` when it's time to cut a release.
+
 ### PR titles
 
 The PR title becomes the commit title on merge (squash) or lands as-is (rebase). It needs to follow this format:
@@ -406,6 +413,7 @@ Add `!` after the type (or include `BREAKING CHANGE:` in the PR body) to trigger
 ### Branch naming
 
 No specific format required — release-please only reads commit/PR titles, not branch names.
+
 
 ## Uninstalling
 
