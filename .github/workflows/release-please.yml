@@ -1,0 +1,37 @@
+name: release-please
+
+on:
+  push:
+    branches:
+      - master
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    steps:
+      # Parse Conventional Commits since the last tag, open/update a release PR
+      # that bumps MAJOR/MINOR/PATCH_VERSION in modloader.gd and updates
+      # CHANGELOG.md. Merging that PR creates the tag + GitHub Release.
+      - uses: googleapis/release-please-action@v4
+        id: release
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+      # Attach modloader.gd and override.cfg to the release so
+      # /releases/latest/download/<file> works for the installers.
+      - uses: actions/checkout@v4
+        if: ${{ steps.release.outputs.release_created }}
+
+      - name: Upload release assets
+        if: ${{ steps.release.outputs.release_created }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.release.outputs.tag_name }}
+        run: |
+          gh release upload "$TAG" modloader.gd override.cfg --clobber
