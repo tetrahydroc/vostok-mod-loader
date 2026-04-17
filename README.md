@@ -358,6 +358,55 @@ With Developer Mode enabled, a full conflict log is written to `%APPDATA%\Road t
 - **`UpdateTooltip()` is inventory-only.** World-item tooltips come from `HUD._physics_process` reading `gameData.tooltip`.
 - **Test with other mods installed** and check the conflict report.
 
+## Contributing
+
+This repo uses **Conventional Commits** to drive automatic version bumps and changelog generation via [release-please](https://github.com/googleapis/release-please). When a PR merges to `master`, release-please opens a follow-up PR that bumps the version in `modloader.gd` and updates `CHANGELOG.md`. Merging that PR creates the git tag and GitHub Release.
+
+### PR titles
+
+The PR title becomes the commit title on merge (squash) or lands as-is (rebase). It needs to follow this format:
+
+```
+<type>: <description>
+```
+
+**Triggers a version bump:**
+
+| Type | Bump | When to use |
+|------|------|-------------|
+| `feat:` | minor (2.3.0 → 2.4.0) | New feature or user-facing behavior |
+| `fix:` | patch (2.3.0 → 2.3.1) | Bug fix, no new functionality |
+| `feat!:` or `fix!:` | major (2.3.0 → 3.0.0) | Breaking change (API rename, removed feature, etc.) |
+
+**No version bump** (still appears in changelog under "Miscellaneous"):
+
+| Type | When to use |
+|------|-------------|
+| `chore:` | Maintenance, deps, housekeeping |
+| `docs:` | Documentation only |
+| `refactor:` | Code restructure, no behavior change |
+| `test:` | Test changes only |
+| `perf:` | Performance improvement |
+| `build:` / `ci:` / `style:` | Build, CI, formatting |
+
+### Examples
+
+```
+feat: add register_scene API for mods
+fix: mcm crash on knife draw
+feat!: rename MODLOADER_VERSION to version()
+docs: document hook API in README
+chore: bump release-please config schema
+```
+
+### Breaking changes
+
+Add `!` after the type (or include `BREAKING CHANGE:` in the PR body) to trigger a major bump. Describe what breaks in the PR body so the changelog entry is useful.
+
+### Branch naming
+
+No specific format required — release-please only reads commit/PR titles, not branch names.
+
 ## Uninstalling
 
 Delete `override.cfg` and `modloader.gd` from the game folder. The `mods` folder and its contents can be removed separately.
