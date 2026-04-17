@@ -11,7 +11,7 @@ extends Node
 # The major/minor/patch accessors parse this single source of truth so mods can
 # compare against it without hand-maintaining a second set of constants.
 # x-release-please-start-version
-const MODLOADER_VERSION := "2.3.0"
+const MODLOADER_VERSION := "3.0.0"
 # x-release-please-end
 
 static func version() -> String:
