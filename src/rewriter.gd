@@ -741,7 +741,9 @@ func _rtv_inject_aispawner_registry(indent: String) -> String:
 	out += I1 + "var overrides: Dictionary = Engine.get_meta(\"_rtv_ai_overrides\", {})\n"
 	out += I1 + "if overrides.is_empty():\n"
 	out += I1 + I1 + "return vanilla\n"
-	out += I1 + "var key := Zone.keys()[z]\n"
+	# Zone.keys() returns Array (untyped), so `:=` can't infer. Type
+	# explicitly for strict-mode GDScript parsers.
+	out += I1 + "var key: String = Zone.keys()[z]\n"
 	out += I1 + "if overrides.has(key):\n"
 	out += I1 + I1 + "return overrides[key]\n"
 	out += I1 + "return vanilla\n"
