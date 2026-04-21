@@ -10,7 +10,7 @@
 # The major/minor/patch accessors parse this single source of truth so mods can
 # compare against it without hand-maintaining a second set of constants.
 # x-release-please-start-version
-const MODLOADER_VERSION := "2.3.1"
+const MODLOADER_VERSION := "2.4.0"
 # x-release-please-end
 
 const MODLOADER_RES_PATH := "res://modloader.gd"
@@ -29,7 +29,14 @@ const DISABLED_FILE := "modloader_disabled"
 const MAX_RESTART_COUNT := 2
 
 const HOOK_PACK_DIR := "user://modloader_hooks"
-const HOOK_PACK_ZIP := "user://modloader_hooks/framework_pack.zip"
+# Hook pack filename: "<prefix>_<timestamp_ms>.zip". A fresh filename per
+# _generate_hook_pack call sidesteps ProjectSettings.load_resource_pack's
+# path-dedup (a same-path re-mount is a no-op and the VFS keeps stale file
+# offsets from the original mount -- FileAccess reads return prior-session
+# bytes even though ZIPPacker rewrote the file on disk). Different filename
+# = new mount = fresh offsets. Orphan files from prior sessions are cleaned
+# up at static-init in _mount_previous_session before any mount happens.
+const HOOK_PACK_PREFIX := "framework_pack"
 const HOOK_PACK_MOUNT_BASE := "res://modloader_hooks"
 const VANILLA_CACHE_DIR := "user://modloader_hooks/vanilla"
 const MODWORKSHOP_VERSIONS_URL := "https://api.modworkshop.net/mods/versions"
@@ -117,6 +124,12 @@ var _archive_file_sets: Dictionary = {}
 # lowercase. A bare name (no suffix) is a replace hook (first-wins).
 signal frameworks_ready
 var _hooks: Dictionary = {}              # hook_name -> Array of {callback, priority, id}
+# Dev-mode-only: per-hook_base dispatch counter. Incremented inside each
+# wrapper AFTER the _any_mod_hooked short-circuit when _developer_mode is
+# true. Summary at 30s timer in _activate_rewritten_scripts pinpoints
+# runaway method calls (e.g. connect-already-connected error spam from a
+# _ready firing thousands of times).
+var _dispatch_counts: Dictionary = {}
 # Fast-path short-circuit: flipped true the first time any mod calls hook().
 # Dispatch wrappers skip the full _wrapper_active/_caller/_dispatch path
 # when no mod has hooked anything at all. Sticky -- stays true once set.
@@ -152,6 +165,14 @@ var _ready_is_coroutine_by_path: Dictionary = {}  # res_path -> bool. Sync (fals
 var _pending_script_overrides: Array[Dictionary] = []  # {vanilla_path, mod_script_path, mod_name, priority}
 var _applied_script_overrides: Dictionary = {}         # vanilla_path -> true
 
+# Opt-in declarations (v2.4.0 cutover). Populated by the [hooks] parser in
+# mod_loading.gd and by .hook() call scanning. Drives the wrap surface in
+# _generate_hook_pack. If both are empty AND _any_mod_declared_registry is
+# false, _generate_hook_pack early-returns and no hook pack is produced --
+# the modlist behaves byte-identical to pre-hook-system (v2.1.0) behavior.
+var _hooked_methods: Dictionary = {}             # res_path -> {method_name: true}
+var _any_mod_declared_registry: bool = false     # set by [registry] parser
+
 var _re_take_over: RegEx
 var _re_extends: RegEx
 var _re_extends_classname: RegEx
@@ -159,6 +180,7 @@ var _re_class_name: RegEx
 var _re_func: RegEx
 var _re_preload: RegEx
 var _re_filename_priority: RegEx
+var _re_hook_call: RegEx
 
 # Rewriter regex (compiled in _rtv_compile_codegen_regex)
 var _rtv_re_extends: RegEx
