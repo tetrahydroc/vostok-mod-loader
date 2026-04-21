@@ -1,5 +1,4 @@
 ## ----- registry/fish.gd -----
-## Section 11: fish_species (FishPool species array additions).
 ##
 ## Vanilla FishPool.gd is a MeshInstance3D placed in scenes (several per map)
 ## with an `@export var species: Array[PackedScene]` populated in the editor.
@@ -20,7 +19,7 @@
 ##
 ## Timing: FishPool is a scene Node, not an autoload. Its _ready() fires
 ## when its containing scene loads. Mods must register before entering the
-## map scene -- mod autoload _ready() is fine, as the main menu loads
+## map scene; mod autoload _ready() is fine, as the main menu loads
 ## first and any map scene comes later.
 
 const _FISH_ENGINE_META_KEY := "_rtv_fish_species"
@@ -53,7 +52,7 @@ func _register_fish_species(id: String, data: Variant) -> bool:
 	if not (scene is PackedScene):
 		push_warning("[Registry] register('fish_species', '%s'): scene is not a PackedScene" % id)
 		return false
-	# Default pool_id to "all" if not given -- most mods want their fish
+	# Default pool_id to "all" if not given; most mods want their fish
 	# in every pool. Explicit pool names override for fine-grained placement.
 	var pool_id: String = "all"
 	if d.has("pool_id"):

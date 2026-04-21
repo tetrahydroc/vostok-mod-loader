@@ -1,5 +1,4 @@
 ## ----- registry/ai.gd -----
-## Section 10: ai_types (AISpawner zone -> agent scene overrides).
 ##
 ## Vanilla AISpawner.gd hardcodes a zone -> agent-scene mapping:
 ##   if zone == Zone.Area05: agent = bandit
@@ -38,7 +37,7 @@ const _AI_ENGINE_META_KEY := "_rtv_ai_overrides"
 func _rebuild_ai_engine_meta() -> void:
 	# Collapse all active id registrations into a single zone -> scene dict
 	# for the resolver. If multiple mods register/override the same zone,
-	# the last write wins -- same semantics as other registries that share
+	# the last write wins; same semantics as other registries that share
 	# a slot.
 	var flat: Dictionary = {}
 	var reg: Dictionary = _registry_registered.get("ai_types", {})
@@ -83,7 +82,7 @@ func _register_ai_type(id: String, data: Variant) -> bool:
 	# zone; use override to forcibly replace someone else's claim.
 	for existing_id in reg.keys():
 		if reg[existing_id]["zone"] == zone:
-			push_warning("[Registry] register('ai_types', '%s'): zone '%s' already claimed by '%s' -- use override to replace" % [id, zone, existing_id])
+			push_warning("[Registry] register('ai_types', '%s'): zone '%s' already claimed by '%s'; use override to replace" % [id, zone, existing_id])
 			return false
 	reg[id] = {"scene": scene, "zone": zone}
 	_registry_registered["ai_types"] = reg

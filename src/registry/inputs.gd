@@ -1,5 +1,4 @@
 ## ----- registry/inputs.gd -----
-## Section 8: inputs (Godot InputMap actions).
 ##
 ## Thin wrapper over InputMap.add_action / erase_action / action_add_event
 ## so mods can declare their own input actions with a default keybind.
@@ -9,8 +8,8 @@
 ##
 ## Data shape:
 ##   register: {display_label: String, default_event: InputEvent, deadzone: float (optional, default 0.5)}
-##   override: same shape -- replaces the default event on an existing action (vanilla or mod)
-##   patch:    {display_label, default_event, deadzone} subset -- mutates the
+##   override: same shape; replaces the default event on an existing action (vanilla or mod)
+##   patch:    {display_label, default_event, deadzone} subset; mutates the
 ##             registry metadata (display_label + deadzone) and/or swaps the
 ##             event on InputMap.
 ##
@@ -22,7 +21,7 @@
 ## that UI). Registering an action here makes it functional in-game, but it
 ## won't appear in the rebind menu until a hook on Inputs-createactions-pre
 ## merges lib.get_entry(INPUTS, id) results into the UI's dict. That hook
-## isn't installed by this registry -- mod authors can install it themselves,
+## isn't installed by this registry; mod authors can install it themselves,
 ## or we add it via a loader-installed hook pack later.
 ##
 ## User keybind persistence: vanilla stores rebinds in user://Preferences.tres
@@ -68,7 +67,7 @@ func _register_input(id: String, data: Variant) -> bool:
 		push_warning("[Registry] register('inputs', '%s'): already registered by a mod" % id)
 		return false
 	if InputMap.has_action(id):
-		push_warning("[Registry] register('inputs', '%s'): action already exists in InputMap (vanilla or another mod -- use override instead)" % id)
+		push_warning("[Registry] register('inputs', '%s'): action already exists in InputMap (vanilla or another mod; use override instead)" % id)
 		return false
 	var payload := _validate_input_payload(id, "register", data)
 	if payload.is_empty():
@@ -95,7 +94,7 @@ func _override_input(id: String, data: Variant) -> bool:
 			originals.append(e)
 		# InputMap has no deadzone getter pre-4.x; grab via project_settings
 		# if available, else assume default. Action deadzone isn't routinely
-		# inspected so we can accept approximation -- only matters for revert.
+		# inspected so we can accept approximation; only matters for revert.
 		ov[id] = {
 			"events": originals,
 			"deadzone": _DEFAULT_DEADZONE,
@@ -235,7 +234,7 @@ func _revert_input(id: String, fields: Array) -> bool:
 			ov.erase(id)
 			_registry_overridden["inputs"] = ov
 			# If the action was vanilla (no registered entry in reg beyond
-			# an override-added stub), leave reg intact -- reg now reflects
+			# an override-added stub), leave reg intact; reg now reflects
 			# vanilla state. If the mod also registered the action itself,
 			# reg stays pointing at the mod's registration.
 			did_something = true

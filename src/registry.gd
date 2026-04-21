@@ -21,8 +21,8 @@
 ##
 ## Timing constraint: Trader / LootContainer / LootSimulation fill local
 ## buckets from LootTables in their `_ready()` and never re-read. Mod authors
-## MUST register loot during their own mod `_ready()` -- earlier in the
-## autoload order -- or their entries won't propagate to world loot and
+## MUST register loot during their own mod `_ready()`; earlier in the
+## autoload order; or their entries won't propagate to world loot and
 ## traders. Runtime re-registration after scene load is invisible.
 
 # Registry name constants. Mods use lib.Registry.SCENES etc. instead of raw
@@ -91,7 +91,7 @@ func register(registry: String, id: String, data: Variant) -> bool:
 		"ai_types": return _register_ai_type(id, data)
 		"fish_species": return _register_fish_species(id, data)
 		"resources":
-			push_warning("[Registry] register: 'resources' doesn't support register (the target .tres already exists in vanilla -- use patch to mutate its fields)")
+			push_warning("[Registry] register: 'resources' doesn't support register (the target .tres already exists in vanilla; use patch to mutate its fields)")
 			return false
 		_:
 			push_warning("[Registry] register: unknown registry '%s'" % registry)
@@ -111,36 +111,36 @@ func override(registry: String, id: String, data: Variant) -> bool:
 		"recipes": return _override_recipe(id, data)
 		"events": return _override_event(id, data)
 		"trader_pools":
-			push_warning("[Registry] override: 'trader_pools' doesn't support override (pool entries are boolean flags on ItemData -- just register/remove)")
+			push_warning("[Registry] override: 'trader_pools' doesn't support override (pool entries are boolean flags on ItemData; just register/remove)")
 			return false
 		"trader_tasks": return _override_trader_task(id, data)
 		"inputs": return _override_input(id, data)
 		"scene_paths": return _override_scene_path(id, data)
 		"shelters":
-			push_warning("[Registry] override: 'shelters' doesn't support override (it's an append-only list -- use register/remove)")
+			push_warning("[Registry] override: 'shelters' doesn't support override (it's an append-only list; use register/remove)")
 			return false
 		"random_scenes":
-			push_warning("[Registry] override: 'random_scenes' doesn't support override (append-only list -- use register/remove)")
+			push_warning("[Registry] override: 'random_scenes' doesn't support override (append-only list; use register/remove)")
 			return false
 		"ai_types": return _override_ai_type(id, data)
 		"fish_species":
-			push_warning("[Registry] override: 'fish_species' doesn't support override (append-only list -- use register/remove)")
+			push_warning("[Registry] override: 'fish_species' doesn't support override (append-only list; use register/remove)")
 			return false
 		"resources":
-			push_warning("[Registry] override: 'resources' doesn't support override (vanilla .tres already exists -- use patch to mutate fields)")
+			push_warning("[Registry] override: 'resources' doesn't support override (vanilla .tres already exists; use patch to mutate fields)")
 			return false
 		_:
 			push_warning("[Registry] override: unknown registry '%s'" % registry)
 			return false
 
 ## Partial update: merge `fields` into the entry at `id`. Not every registry
-## supports patch -- scenes are monolithic PackedScenes, loot entries are
+## supports patch; scenes are monolithic PackedScenes, loot entries are
 ## bare ItemData references (patch via the items registry instead). Returns
 ## false with guidance on unsupported registries.
 ##
 ## `id` is String for most registries. The 'recipes' and 'events' registries
 ## also accept a direct Resource ref (RecipeData / EventData) so mods can
-## patch vanilla entries without first registering a handle -- same
+## patch vanilla entries without first registering a handle; same
 ## semantics, just skips the indirection when the mod already holds the ref.
 func patch(registry: String, id: Variant, fields: Dictionary) -> bool:
 	if id is String and id == "":
@@ -148,7 +148,7 @@ func patch(registry: String, id: Variant, fields: Dictionary) -> bool:
 		return false
 	match registry:
 		"scenes":
-			push_warning("[Registry] patch: 'scenes' registry doesn't support patch (scenes are monolithic PackedScenes -- use override instead)")
+			push_warning("[Registry] patch: 'scenes' registry doesn't support patch (scenes are monolithic PackedScenes; use override instead)")
 			return false
 		"items":
 			if not (id is String):
@@ -156,7 +156,7 @@ func patch(registry: String, id: Variant, fields: Dictionary) -> bool:
 				return false
 			return _patch_item(id, fields)
 		"loot":
-			push_warning("[Registry] patch: 'loot' registry doesn't support patch (loot entries are ItemData references -- patch the ItemData via the 'items' registry instead)")
+			push_warning("[Registry] patch: 'loot' registry doesn't support patch (loot entries are ItemData references; patch the ItemData via the 'items' registry instead)")
 			return false
 		"sounds":
 			if not (id is String):
@@ -166,7 +166,7 @@ func patch(registry: String, id: Variant, fields: Dictionary) -> bool:
 		"recipes": return _patch_recipe(id, fields)
 		"events": return _patch_event(id, fields)
 		"trader_pools":
-			push_warning("[Registry] patch: 'trader_pools' doesn't support patch (entries are boolean flags -- use register/remove)")
+			push_warning("[Registry] patch: 'trader_pools' doesn't support patch (entries are boolean flags; use register/remove)")
 			return false
 		"trader_tasks": return _patch_trader_task(id, fields)
 		"inputs":
@@ -186,7 +186,7 @@ func patch(registry: String, id: Variant, fields: Dictionary) -> bool:
 			push_warning("[Registry] patch: 'random_scenes' doesn't support patch (entries are bare paths)")
 			return false
 		"ai_types":
-			push_warning("[Registry] patch: 'ai_types' doesn't support patch (entries are {scene, zone} refs -- use override to swap the scene)")
+			push_warning("[Registry] patch: 'ai_types' doesn't support patch (entries are {scene, zone} refs; use override to swap the scene)")
 			return false
 		"fish_species":
 			push_warning("[Registry] patch: 'fish_species' doesn't support patch (entries are {scene, pool_id} refs)")
@@ -201,7 +201,7 @@ func patch(registry: String, id: Variant, fields: Dictionary) -> bool:
 			return false
 
 ## Undo a register(). Fails if the id wasn't registered by a mod (can't
-## remove vanilla entries via this API -- use override with a disabled
+## remove vanilla entries via this API; use override with a disabled
 ## equivalent, or rely on the game's own toggle mechanisms).
 func remove(registry: String, id: String) -> bool:
 	match registry:

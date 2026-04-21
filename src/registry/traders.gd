@@ -1,13 +1,11 @@
 ## ----- registry/traders.gd -----
-## Section 7: trader_pools + trader_tasks.
-##
 ## Two related registries that both mutate trader-adjacent state:
 ##
 ## - trader_pools: enables an ItemData to appear in a named trader's supply
 ##   bucket. Trader.FillTraderBucket() walks LT_Master and filters by
 ##   boolean trader flags on each item (itemData.generalist / .doctor /
 ##   .gunsmith / .grandma). So "register an item into the Doctor's pool" =
-##   set itemData.doctor = true. Register / remove only -- no override or
+##   set itemData.doctor = true. Register / remove only; no override or
 ##   patch (entries are single boolean flags, there's nothing to override).
 ##
 ## - trader_tasks: appends/overrides/patches TaskData entries in a
@@ -103,7 +101,7 @@ func _remove_trader_pool(id: String) -> bool:
 	_log_debug("[Registry] removed trader_pool '%s'" % id)
 	return true
 
-# Revert on trader_pools is a straight alias for remove -- there's no
+# Revert on trader_pools is a straight alias for remove; there's no
 # override layer. Accept it for API symmetry so mods can call revert
 # uniformly across registries.
 func _revert_trader_pool(id: String) -> bool:
@@ -218,7 +216,7 @@ func _override_trader_task(id: String, data: Variant) -> bool:
 		push_warning("[Registry] override('trader_tasks', '%s'): 'replaces' not present in %s.tasks" % [id, trader])
 		return false
 	if new_task in arr:
-		push_warning("[Registry] override('trader_tasks', '%s'): new task already in array -- would duplicate" % id)
+		push_warning("[Registry] override('trader_tasks', '%s'): new task already in array; would duplicate" % id)
 		return false
 	arr[idx] = new_task
 	ov[id] = {

@@ -1,5 +1,4 @@
 ## ----- registry/sounds.gd -----
-## Section 4: sounds (AudioLibrary.tres @export AudioEvent fields).
 ##
 ## AudioLibrary is a plain Resource at res://Resources/AudioLibrary.tres, not
 ## an autoload. Every script that uses audio does `preload("res://Resources/
@@ -21,7 +20,7 @@
 ## .knifeSlash`, so a newly registered id isn't reachable from vanilla code.
 ## Mods wanting to play their own sounds must fetch via
 ## `lib.get_entry(lib.Registry.SOUNDS, "mymod_pickup")` or, equivalently,
-## `audioLibrary.get("mymod_pickup")` -- both resolve through the same
+## `audioLibrary.get("mymod_pickup")`; both resolve through the same
 ## storage (see _lookup_sound). Use override to affect what vanilla plays.
 
 const _AUDIO_LIBRARY_PATH := "res://Resources/AudioLibrary.tres"
@@ -35,7 +34,7 @@ func _audio_library() -> Resource:
 	var lib = load(_AUDIO_LIBRARY_PATH)
 	if lib == null:
 		if not _audio_library_warned:
-			push_warning("[Registry] sounds: AudioLibrary.tres missing at %s -- sounds registry is inert" % _AUDIO_LIBRARY_PATH)
+			push_warning("[Registry] sounds: AudioLibrary.tres missing at %s; sounds registry is inert" % _AUDIO_LIBRARY_PATH)
 			_audio_library_warned = true
 		return null
 	_audio_library_cache = lib
@@ -45,7 +44,7 @@ func _audio_library() -> Resource:
 # AudioEvent Resource (or null with warning on bad input).
 #
 # AudioEvent's class script is loaded dynamically from the existing library
-# -- we don't know its res:// path up front and don't want to hardcode it.
+#; we don't know its res:// path up front and don't want to hardcode it.
 # Pull the class from any existing @export AudioEvent on the library. This
 # also tolerates the game renaming or moving AudioEvent.gd.
 func _coerce_audio_event(id: String, verb: String, data: Variant) -> Resource:
@@ -152,7 +151,7 @@ func _override_sound(id: String, data: Variant) -> bool:
 	if lib == null:
 		return false
 	if not _sound_exists_in_vanilla(id):
-		# Mod-registered ids can't be overridden -- that's what a second
+		# Mod-registered ids can't be overridden; that's what a second
 		# register call would be conceptually, but we reject re-register.
 		# Force mods to revert first.
 		push_warning("[Registry] override('sounds', '%s'): no vanilla AudioLibrary field with that name (register can't be overridden; revert the register first)" % id)
@@ -200,7 +199,7 @@ func _remove_sound(id: String) -> bool:
 		push_warning("[Registry] remove('sounds', '%s'): not registered by a mod" % id)
 		return false
 	# Sounds don't have the items-style override-lives-in-registered dual
-	# storage -- overrides mutate the library directly, not this dict. So
+	# storage; overrides mutate the library directly, not this dict. So
 	# anything in reg is a plain register.
 	reg.erase(id)
 	_registry_registered["sounds"] = reg

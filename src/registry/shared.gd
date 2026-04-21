@@ -40,7 +40,7 @@ func _typed_array_accepts(arr: Array, item: Variant) -> bool:
 	# script. Walk item's script chain; any match means it's a valid subclass.
 	var required = arr.get_typed_script()
 	if required == null:
-		# Typed by built-in type, not a script class -- fall back to duck check.
+		# Typed by built-in type, not a script class; fall back to duck check.
 		return true
 	if not (item is Object):
 		return false

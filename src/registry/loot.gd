@@ -1,16 +1,15 @@
 ## ----- registry/loot.gd -----
-## Section 3: loot (LootTable.items mutation).
 ##
 ## Loot registrations mutate the `items: Array[ItemData]` on loaded LootTable
 ## Resources. Godot's Resource cache ensures every `load("res://Loot/X.tres")`
 ## returns the same instance, so appending to that array affects any later
-## consumer that reads it -- provided the consumer hasn't already copied it
+## consumer that reads it; provided the consumer hasn't already copied it
 ## into a local bucket (see registry.gd module docstring for the timing
 ## constraint: mods must register during their own _ready()).
 ##
 ## Data shape (passed to register/override):
 ##   {item: ItemData, table: String}
-## Override additionally requires `replaces: ItemData` -- the existing entry
+## Override additionally requires `replaces: ItemData`; the existing entry
 ## to swap out. `table` is either a LootTable name like "LT_Master" (resolved
 ## to its .tres path) or an absolute res:// path. Named tables are the
 ## idiomatic form for vanilla; paths are the escape hatch.
@@ -110,7 +109,7 @@ func _register_loot(id: String, data: Variant) -> bool:
 		return false
 	# Idempotent append: don't double-insert if the mod's item is already in
 	# the table (e.g., after an editor rebuild). The existing entry isn't
-	# ours to track, so we still fail the register -- mod authors should use
+	# ours to track, so we still fail the register; mod authors should use
 	# override if they want to force a swap.
 	if item in table_res.items:
 		push_warning("[Registry] register('loot', '%s'): item is already present in table; use override to swap an existing entry" % id)
@@ -151,7 +150,7 @@ func _override_loot(id: String, data: Variant) -> bool:
 		push_warning("[Registry] override('loot', '%s'): 'replaces' item not present in table" % id)
 		return false
 	if new_item in table_res.items:
-		push_warning("[Registry] override('loot', '%s'): new item is already in the table -- would duplicate" % id)
+		push_warning("[Registry] override('loot', '%s'): new item is already in the table; would duplicate" % id)
 		return false
 	table_res.items[idx] = new_item
 	ov[id] = {
@@ -210,7 +209,7 @@ func _revert_loot(id: String) -> bool:
 	if idx >= 0:
 		table_res.items[idx] = old_item
 	else:
-		# Override entry is gone -- someone (another mod? sanitizer?) stripped
+		# Override entry is gone; someone (another mod? sanitizer?) stripped
 		# it. Put the original back at the end rather than nothing.
 		push_warning("[Registry] revert('loot', '%s'): override entry missing from table, appending original at end" % id)
 		table_res.items.append(old_item)

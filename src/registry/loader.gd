@@ -1,5 +1,4 @@
 ## ----- registry/loader.gd -----
-## Section 9: scene_paths + shelters + random_scenes.
 ##
 ## Three related registries that all mutate state on the Loader autoload.
 ## The rewriter injects into Loader.gd:
@@ -20,7 +19,7 @@
 ##     remove / revert: standard
 ##
 ## - shelters: append-only list of shelter NAMES (each name must also be a
-##   resolvable scene -- pass `{path, ...}` and we'll auto-register in
+##   resolvable scene; pass `{path, ...}` and we'll auto-register in
 ##   scene_paths too, or pass just {} if the name is already a vanilla
 ##   scene or was pre-registered via scene_paths)
 ##     register: {path?: String, menu?: bool, shelter?: bool, ...}
@@ -35,7 +34,7 @@
 func _loader_node() -> Node:
 	var ldr = get_tree().root.get_node_or_null("Loader")
 	if ldr == null:
-		push_warning("[Registry] Loader autoload not in tree yet -- is the loader still booting?")
+		push_warning("[Registry] Loader autoload not in tree yet; is the loader still booting?")
 	return ldr
 
 # GDScript's has_script_constant() isn't a real API; script constants are
@@ -65,7 +64,7 @@ func _register_scene_path(id: String, data: Variant) -> bool:
 	if ldr == null:
 		return false
 	if not ("_rtv_mod_scene_paths" in ldr):
-		push_warning("[Registry] register('scene_paths'): Loader.gd is missing injected scene-path fields -- rewriter didn't fire, is the hook pack installed?")
+		push_warning("[Registry] register('scene_paths'): Loader.gd is missing injected scene-path fields; rewriter didn't fire, is the hook pack installed?")
 		return false
 	# Collision: an existing mod registration, or a mod override on this id.
 	if ldr._rtv_mod_scene_paths.has(id) or ldr._rtv_override_scene_paths.has(id):
@@ -73,7 +72,7 @@ func _register_scene_path(id: String, data: Variant) -> bool:
 		return false
 	# Collision with vanilla: vanilla scene names are the top-level const
 	# identifiers on Loader (Cabin, Attic, etc.). Reject so mods use
-	# override() instead. Detect via script constant map -- Loader.gd's
+	# override() instead. Detect via script constant map; Loader.gd's
 	# const declarations are still intact for scene paths.
 	if _vanilla_scene_const_exists(ldr, id):
 		push_warning("[Registry] register('scene_paths', '%s'): name collides with a vanilla scene const; use override instead" % id)

@@ -1,5 +1,4 @@
 ## ----- registry/recipes.gd -----
-## Section 5: crafting recipes (Recipes.tres per-category arrays).
 ##
 ## Recipes.tres is a Resource with seven Array[RecipeData] fields: consumables,
 ## medical, equipment, weapons, electronics, misc, furniture. Interface.gd
@@ -7,7 +6,7 @@
 ## the crafting tab the player opened. Godot's Resource cache means every
 ## `load()` (or const preload) of Recipes.tres returns the same instance, so
 ## appending a RecipeData to a category array propagates to the crafting UI
-## provided the mod mutates before Interface._ready() fires -- same timing
+## provided the mod mutates before Interface._ready() fires; same timing
 ## constraint as loot.
 ##
 ## RecipeData has no unique id field (just name + input + output + proximity
@@ -16,7 +15,7 @@
 ##   register: {recipe: RecipeData, category: "consumables"}
 ##   override: {recipe: RecipeData, category, replaces: RecipeData}
 ##   patch:    id can be a String handle OR a RecipeData Resource ref
-##             directly -- lets mods patch vanilla recipes in one call
+##             directly; lets mods patch vanilla recipes in one call
 ##             without registering a handle first.
 ##
 ## Patch rollback keys on object identity (get_instance_id) when the caller
@@ -35,7 +34,7 @@ func _recipes_resource() -> Resource:
 	var res = load(_RECIPES_PATH)
 	if res == null:
 		if not _recipes_warned:
-			push_warning("[Registry] recipes: Recipes.tres missing at %s -- recipes registry is inert" % _RECIPES_PATH)
+			push_warning("[Registry] recipes: Recipes.tres missing at %s; recipes registry is inert" % _RECIPES_PATH)
 			_recipes_warned = true
 		return null
 	_recipes_cache = res
@@ -128,7 +127,7 @@ func _override_recipe(id: String, data: Variant) -> bool:
 		push_warning("[Registry] override('recipes', '%s'): 'replaces' not present in category '%s'" % [id, category])
 		return false
 	if new_recipe in arr:
-		push_warning("[Registry] override('recipes', '%s'): new recipe already in category -- would duplicate" % id)
+		push_warning("[Registry] override('recipes', '%s'): new recipe already in category; would duplicate" % id)
 		return false
 	arr[idx] = new_recipe
 	ov[id] = {

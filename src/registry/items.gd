@@ -1,10 +1,9 @@
 ## ----- registry/items.gd -----
-## Section 2: items (ItemData Resources).
 ##
 ## Items are ItemData Resources (or subclasses: WeaponData, AttachmentData, etc).
 ## Godot's Resource caching means every `load("res://Items/.../Potato.tres")`
 ## returns the same instance, so mutating the loaded ItemData mutates it for
-## every holder -- including what saves deserialize on next load, because
+## every holder; including what saves deserialize on next load, because
 ## SlotData serializes ItemData references by-value.
 ##
 ## Vanilla has no central file-string -> ItemData lookup; code passes ItemData
@@ -31,7 +30,7 @@ func _register_item(id: String, data: Variant) -> bool:
 	if reg.has(id):
 		push_warning("[Registry] register('items', '%s'): already registered by a mod" % id)
 		return false
-	# Keep ItemData.file in sync with the registry id -- vanilla code reads
+	# Keep ItemData.file in sync with the registry id; vanilla code reads
 	# itemData.file directly and assumes it matches the item's canonical name.
 	if data.get("file") != id:
 		data.set("file", id)
@@ -101,7 +100,7 @@ func _remove_item(id: String) -> bool:
 		return false
 	# Block remove on entries that are actually overrides, not registrations.
 	# An override lives in reg too (see _override_item rationale) but must be
-	# reverted, not removed -- remove implies "undo a register()".
+	# reverted, not removed; remove implies "undo a register()".
 	var ov: Dictionary = _registry_overridden.get("items", {})
 	if ov.has(id):
 		push_warning("[Registry] remove('items', '%s'): entry is an override, use revert instead" % id)
@@ -168,7 +167,7 @@ func _revert_item(id: String, fields: Array) -> bool:
 	return did_something
 
 # Lookup precedence: mod registrations (which includes overrides) first, then
-# vanilla. Matches the scenes registry's override > mod > vanilla shape --
+# vanilla. Matches the scenes registry's override > mod > vanilla shape;
 # here overrides live inside the mod-registered dict, so the order collapses
 # to "mod entries beat vanilla."
 func _lookup_item(id: String) -> Resource:
@@ -186,7 +185,7 @@ func _build_vanilla_item_cache() -> void:
 	_vanilla_item_cache_built = true
 	var master = load("res://Loot/LT_Master.tres")
 	if master == null or not ("items" in master):
-		push_warning("[Registry] LT_Master.tres missing or unreadable -- items registry lookups will only see mod entries")
+		push_warning("[Registry] LT_Master.tres missing or unreadable; items registry lookups will only see mod entries")
 		return
 	for it in master.items:
 		if it == null:

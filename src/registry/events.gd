@@ -1,5 +1,4 @@
 ## ----- registry/events.gd -----
-## Section 6: events (Events.tres events array + EventData field patches).
 ##
 ## Events.tres holds a single `events: Array[EventData]` that EventSystem.gd
 ## const-preloads and filters into per-type buckets (dynamic/trader/special)
@@ -14,7 +13,7 @@
 ##   register: {event: EventData}
 ##   override: {event: EventData, replaces: EventData}
 ##   patch:    id can be a String handle OR an EventData Resource ref
-##             directly -- lets mods patch vanilla events in one call
+##             directly; lets mods patch vanilla events in one call
 ##             without registering a handle first.
 ##
 ## Caveat for mod authors: EventData.function is a method name resolved on
@@ -35,7 +34,7 @@ func _events_resource() -> Resource:
 	var res = load(_EVENTS_PATH)
 	if res == null:
 		if not _events_warned:
-			push_warning("[Registry] events: Events.tres missing at %s -- events registry is inert" % _EVENTS_PATH)
+			push_warning("[Registry] events: Events.tres missing at %s; events registry is inert" % _EVENTS_PATH)
 			_events_warned = true
 		return null
 	_events_cache = res
@@ -117,7 +116,7 @@ func _override_event(id: String, data: Variant) -> bool:
 		push_warning("[Registry] override('events', '%s'): 'replaces' not present in Events.events" % id)
 		return false
 	if new_event in arr:
-		push_warning("[Registry] override('events', '%s'): new event already in array -- would duplicate" % id)
+		push_warning("[Registry] override('events', '%s'): new event already in array; would duplicate" % id)
 		return false
 	arr[idx] = new_event
 	ov[id] = {

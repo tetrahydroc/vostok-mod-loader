@@ -1,5 +1,4 @@
 ## ----- registry/resources.gd -----
-## Section 12 (final): resources -- the raw-Resource escape hatch.
 ##
 ## Patches arbitrary field values on any vanilla .tres file. Intended as the
 ## generic fallback for Resources that don't have a dedicated registry: stat
@@ -14,7 +13,7 @@
 ## The `id` is the absolute res:// path to the .tres. Godot's Resource cache
 ## ensures every `load()` of that path returns the same instance, so
 ## mutating fields on the loaded Resource propagates to all game-side
-## holders. No register/override/remove -- vanilla already defines the
+## holders. No register/override/remove; vanilla already defines the
 ## Resource; we only mutate fields and track rollback.
 ##
 ## Field stash keys per path, so the same path can be patched multiple
