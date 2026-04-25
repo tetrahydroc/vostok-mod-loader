@@ -82,6 +82,13 @@ func _merge_hook_calls_into_wrap_mask() -> void:
 			var prefix: String = entry["prefix"]
 			var method: String = entry["method"]
 			if not prefix_to_path.has(prefix):
+				# Source-scan saw a .hook("<prefix>-<method>-...") call but
+				# we can't resolve <prefix> to any vanilla script. After the
+				# pass-1/pass-2 reorder this should only fire for genuine
+				# typos or hooks targeting a renamed/removed script -- log
+				# loudly so the mod author isn't debugging a silent miss.
+				_log_warning("[Hooks] %s calls .hook(\"%s-%s-...\") but no vanilla script matches prefix '%s' -- check spelling, or declare the path in [hooks] in mod.txt" \
+						% [mod_name, prefix, method, prefix])
 				continue
 			var path: String = prefix_to_path[prefix]
 			if not _hooked_methods.has(path):
@@ -138,7 +145,11 @@ func _process_mod_candidate(c: Dictionary, load_index: int) -> void:
 			if status.begins_with("nested:"):
 				_log_warning("  Invalid mod -- packaged incorrectly (nested mod.txt at " + status.substr(7) + ")")
 			elif status == "parse_error":
-				_log_warning("  Invalid mod -- mod.txt failed to parse")
+				var detail: String = c.get("mod_txt_error", "")
+				if detail.is_empty():
+					_log_warning("  Invalid mod -- mod.txt failed to parse")
+				else:
+					_log_warning("  Invalid mod -- mod.txt parse error at " + detail)
 			else:
 				_log_warning("  No mod.txt -- autoloads skipped")
 		return
